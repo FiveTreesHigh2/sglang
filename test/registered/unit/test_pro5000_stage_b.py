@@ -83,6 +83,8 @@ def test_bootstrap_uses_core_only_runtime_jit() -> None:
     assert "86a0944b4cadde0a4227f249e5a0fe466207d7c25e8eb7dee4c3f75fdd5f9bbf" not in content
     assert 'importlib.metadata.version("flashinfer-jit-cache")' in content
     assert 'uv pip uninstall --python "${PYTHON}" flashinfer-jit-cache' in content
+    assert content.count("-i https://pypi.tuna.tsinghua.edu.cn/simple") == 3
+    assert "--index-url https://docs.sglang.ai/whl/cu130/" in content
     assert "FLASHINFER_DISABLE_JIT=1" in content
     assert "--real-shapes" in content
     assert "nvidia-cutlass-dsl-libs-cu13==4.5.2" in content
@@ -97,4 +99,5 @@ def test_stage_b_readme_preserves_old_environment_and_uses_detached_checkout() -
     assert "bash scripts/pro5000/bootstrap_stage_b.sh" in readme
     assert "不安装 `flashinfer-jit-cache`" in readme
     assert "NVCC runtime-JIT" in readme
+    assert "安装中断后可直接重新运行" in readme
     assert "rm -rf" not in readme

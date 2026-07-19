@@ -9,6 +9,7 @@ JIT-cache/AOT-cache 描述：
 - 依赖固定为 `flashinfer_python==0.6.15.dev20260716`，不使用 `[cu13]` extra；
 - 只下载并校验 core wheel，不安装 `flashinfer-jit-cache`；
 - 若新的 Stage B venv 中有旧流程残留的 JIT-cache，只从该新 venv 卸载；
+- 普通 PyPI 依赖使用清华镜像，`sglang-kernel` 保留 SGLang cu130 专用源；
 - `smoke-no-jit.status` 预期非零，仅保留为诊断证据；
 - 第一次正常 smoke 使用 CUDA 13.0 NVCC runtime-JIT，第二次验证缓存复用；
 - manifest 中 `packages.flashinfer-jit-cache` 预期为 `null`。
@@ -727,8 +728,10 @@ export UV_CACHE_DIR="${CACHE_DIR}/uv"
 export FLASHINFER_WORKSPACE_BASE="${CACHE_DIR}/flashinfer-workspace-base"
 
 uv pip install --python "${PYTHON}" \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple \
   "${WHEELHOUSE}/${CORE_NAME}"
 uv pip install --python "${PYTHON}" \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple \
   --prerelease=allow \
   --index-strategy unsafe-best-match \
   --extra-index-url https://docs.sglang.ai/whl/cu130/ \
@@ -740,6 +743,7 @@ uv pip install --python "${PYTHON}" --force-reinstall --no-deps \
 uv pip install --python "${PYTHON}" --force-reinstall --no-deps \
   "${WHEELHOUSE}/${CORE_NAME}"
 uv pip install --python "${PYTHON}" --force-reinstall --no-deps \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple \
   nvidia-cutlass-dsl-libs-cu13==4.5.2
 
 if "${PYTHON}" -c 'import importlib.metadata; importlib.metadata.version("flashinfer-jit-cache")' \

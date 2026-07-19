@@ -42,6 +42,20 @@ cd /home/logs/sennian/pro5000-fi-moe/sglang
 bash scripts/pro5000/bootstrap_stage_b.sh
 ```
 
+## 安装中断后继续
+
+安装中断后可直接重新运行同一条 bootstrap 命令，不需要删除 `.venv`、wheel 或
+cache：
+
+```bash
+cd /home/logs/sennian/pro5000-fi-moe/sglang
+bash scripts/pro5000/bootstrap_stage_b.sh
+```
+
+脚本会重新校验并跳过已完成的 core wheel；未完成的 `.part` 会继续下载；已有的
+Python 3.12 `.venv` 和 uv cache 会被复用。`uv pip install` 会再次收敛到固定依赖，
+普通 PyPI 包使用清华镜像，`sglang-kernel` 仍使用 SGLang CUDA 13.0 专用源。
+
 bootstrap 最后一行会打印 `STAGE_B_RUN_DIR`。使用打印出的目录执行：
 
 ```bash
