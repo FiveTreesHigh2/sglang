@@ -66,3 +66,21 @@ def test_environment_collector_emits_required_schema() -> None:
     }
     assert set(payload["git"]) >= {"commit", "branch", "dirty"}
     assert "HF_TOKEN" not in payload["environment"]
+
+
+def test_bootstrap_shell_syntax_and_fixed_artifacts() -> None:
+    script = PRO5000_SCRIPTS / "bootstrap_stage_b.sh"
+    completed = subprocess.run(
+        ["bash", "-n", str(script)], text=True, capture_output=True
+    )
+    assert completed.returncode == 0, completed.stderr
+    content = script.read_text()
+    assert "/home/logs/sennian/pro5000-fi-moe" in content
+    assert "0.6.15.dev20260716" in content
+    assert "ed0634d9c32f069dafe7583addf74de7a4f366ae07d3093250109bd315b4ba26" in content
+    assert "86a0944b4cadde0a4227f249e5a0fe466207d7c25e8eb7dee4c3f75fdd5f9bbf" in content
+    assert "FLASHINFER_DISABLE_JIT=1" in content
+    assert "--real-shapes" in content
+    assert "nvidia-cutlass-dsl-libs-cu13==4.5.2" in content
+    assert "rm -rf" not in content
+    assert "/home/logs/sennian/py-venv/sglang5.14" not in content
