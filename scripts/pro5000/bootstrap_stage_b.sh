@@ -95,7 +95,7 @@ uv pip install --python "${PYTHON}" \
   --find-links "${WHEELHOUSE}" \
   -e "${REPO_ROOT}/python"
 uv pip install --python "${PYTHON}" --force-reinstall --no-deps \
-  --index-url https://docs.sglang.ai/whl/cu130/ \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple \
   sglang-kernel==0.4.4
 uv pip install --python "${PYTHON}" --force-reinstall --no-deps \
   "${WHEELHOUSE}/${CORE_NAME}"

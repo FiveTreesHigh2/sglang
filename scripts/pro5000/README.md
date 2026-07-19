@@ -56,7 +56,8 @@ bash scripts/pro5000/bootstrap_stage_b.sh
 Python 3.12 `.venv` 和 uv cache 会被复用。`uv pip install` 会再次收敛到固定依赖，
 editable 安装使用按清华、SGLang cu130 排序的双 `--index` 和 `first-index`：普通
 包及构建依赖在清华命中后不会查询 SGLang 站点，缺失的 CUDA 包才使用 cu130
-源；`sglang-kernel` 最终仍从 SGLang CUDA 13.0 专用源强制安装。
+源；`sglang-kernel==0.4.4` 从清华 PyPI 镜像显式安装。SGLang 发布流程中，PyPI
+上不带 `+cu130` 后缀的 0.4.4 就是去掉本地版本标记后的 CUDA 13.0 构建。
 
 bootstrap 最后一行会打印 `STAGE_B_RUN_DIR`。使用打印出的目录执行：
 
