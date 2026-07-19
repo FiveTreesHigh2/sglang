@@ -17,11 +17,12 @@ PYPROJECT = REPO_ROOT / "python" / "pyproject.toml"
 PRO5000_SCRIPTS = REPO_ROOT / "scripts" / "pro5000"
 
 
-def test_flashinfer_nightly_dependency_is_pinned():
+def test_flashinfer_nightly_dependency_uses_runtime_jit():
     data = tomllib.loads(PYPROJECT.read_text())
     dependencies = data["project"]["dependencies"]
 
-    assert "flashinfer_python[cu13]==0.6.15.dev20260716" in dependencies
+    assert "flashinfer_python==0.6.15.dev20260716" in dependencies
+    assert not any(dependency.startswith("flashinfer_python[") for dependency in dependencies)
 
 
 def _load_script_module(filename: str):
@@ -68,7 +69,7 @@ def test_environment_collector_emits_required_schema() -> None:
     assert "HF_TOKEN" not in payload["environment"]
 
 
-def test_bootstrap_shell_syntax_and_fixed_artifacts() -> None:
+def test_bootstrap_uses_core_only_runtime_jit() -> None:
     script = PRO5000_SCRIPTS / "bootstrap_stage_b.sh"
     completed = subprocess.run(
         ["bash", "-n", str(script)], text=True, capture_output=True
@@ -78,7 +79,10 @@ def test_bootstrap_shell_syntax_and_fixed_artifacts() -> None:
     assert "/home/logs/sennian/pro5000-fi-moe" in content
     assert "0.6.15.dev20260716" in content
     assert "ed0634d9c32f069dafe7583addf74de7a4f366ae07d3093250109bd315b4ba26" in content
-    assert "86a0944b4cadde0a4227f249e5a0fe466207d7c25e8eb7dee4c3f75fdd5f9bbf" in content
+    assert "flashinfer_jit_cache" not in content
+    assert "86a0944b4cadde0a4227f249e5a0fe466207d7c25e8eb7dee4c3f75fdd5f9bbf" not in content
+    assert 'importlib.metadata.version("flashinfer-jit-cache")' in content
+    assert 'uv pip uninstall --python "${PYTHON}" flashinfer-jit-cache' in content
     assert "FLASHINFER_DISABLE_JIT=1" in content
     assert "--real-shapes" in content
     assert "nvidia-cutlass-dsl-libs-cu13==4.5.2" in content
@@ -91,4 +95,6 @@ def test_stage_b_readme_preserves_old_environment_and_uses_detached_checkout() -
     assert "/home/logs/sennian/py-venv/sglang5.14" in readme
     assert "git switch --detach origin/feat/flashinfer-sm120-fp8-moe" in readme
     assert "bash scripts/pro5000/bootstrap_stage_b.sh" in readme
+    assert "不安装 `flashinfer-jit-cache`" in readme
+    assert "NVCC runtime-JIT" in readme
     assert "rm -rf" not in readme

@@ -88,17 +88,17 @@ FlashInfer 目标入口使用相同的权重量化粒度，并采用 token-packe
 
 ## 4. 依赖设计
 
-目标 API 首次出现在 FlashInfer PR #3891 合入后的指定 nightly 中。实验固定
-使用匹配的 core 和 JIT-cache 构建：
+目标 API 首次出现在 FlashInfer PR #3891 合入后的指定 nightly 中。实验只固定
+core 构建：
 
 | 包 | 版本或产物 | SHA256 |
 | --- | --- | --- |
 | `flashinfer-python` | `0.6.15.dev20260716` | `ed0634d9c32f069dafe7583addf74de7a4f366ae07d3093250109bd315b4ba26` |
-| `flashinfer-jit-cache` | `0.6.15.dev20260716+cu130` | `86a0944b4cadde0a4227f249e5a0fe466207d7c25e8eb7dee4c3f75fdd5f9bbf` |
 
 feature branch 将 SGLang 稳定版依赖
-`flashinfer_python[cu13]==0.6.15` 更新为新 API 所需的精确开发版本。
-JIT-cache 的版本前缀必须与 core 版本一致。
+`flashinfer_python[cu13]==0.6.15` 更新为新 API 所需的 plain core 精确开发版本
+`flashinfer_python==0.6.15.dev20260716`。不安装可选的
+`flashinfer-jit-cache`，避免服务器到 GitHub Release 的低速链路阻塞环境构建。
 
 经修正后的服务器工具链事实如下：
 
@@ -108,14 +108,13 @@ JIT-cache 的版本前缀必须与 core 版本一致。
 - CUDA compiler 13.0，NVCC 13.0.48
 - 计算能力 `(12, 0)`
 
-优先使用官方 JIT-cache，以避免首次调用时的编译延迟。生产运行不设置
-`FLASHINFER_DISABLE_JIT`。如果 AOT 产物不存在，FlashInfer 可以使用 NVCC 和
-Ninja 进行 runtime-JIT 回退。bootstrap 会显式预热目标 kernel，并把编译 cache
-放在实验根目录下的持久化位置。
+正常运行不设置 `FLASHINFER_DISABLE_JIT`。FlashInfer 使用服务器已有的 NVCC 和
+Ninja runtime-JIT：第一次正常 smoke 编译并预热目标 kernel，第二次正常 smoke
+验证缓存复用。编译 cache 放在实验根目录下的持久化位置。
 
-`FLASHINFER_DISABLE_JIT=1` 只作为可选诊断项：若调用成功，说明官方
-JIT-cache wheel 包含目标模块；若调用失败，只要取消该变量后能使用 NVCC 编译
-并通过同一个 smoke test，就不阻塞环境验收。
+`FLASHINFER_DISABLE_JIT=1` 只作为可选诊断项。由于没有安装 JIT-cache，该诊断
+预期失败并记录状态；只要取消该变量后的两次正常 smoke 都通过，就不阻塞环境
+验收。
 
 ## 5. SGLang 架构决策
 
@@ -337,14 +336,13 @@ routed MoE 和模型级耗时。测试同时覆盖均匀路由和采集到的真
 2. 将 feature branch 推送到 fork，并记录精确 SHA。
 3. 在服务器把 fork clone 到持久化根目录，checkout 该 SHA。
 4. 使用 `uv` 和 Python 3.12 创建 `.venv`，不修改旧 venv。
-5. 支持断点续传地下载 wheel，并在安装前校验 SHA256。
+5. 支持断点续传地下载 core wheel，并在安装前校验 SHA256。
 6. 安装 fork 和精确依赖，然后运行 `pip check`。
 7. 运行可选 no-JIT 诊断以及必须执行的正常 prewarm/smoke test。
 8. 把 manifest 和输出保存到 `runs/`，再返回输出进行审查。
 
 当新 venv 能在 RTX PRO 5000 上成功调用目标 kernel 且数值正确时，Stage B
-通过。官方 AOT-cache 加载成功，或者经过记录并预热的 CUDA 13.0 runtime-JIT
-编译成功，二者都可接受。
+通过。CUDA 13.0 runtime-JIT 必须成功编译并在第二次运行时复用持久化缓存。
 
 ## 13. 同步与回滚
 

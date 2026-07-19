@@ -1,5 +1,18 @@
 # RTX PRO 5000 Stage B 环境 Implementation Plan
 
+## 2026-07-19 runtime-JIT 修订
+
+服务器到 GitHub Release 的连接出现 131 秒超时，重试后的下载速度只有约
+12–17 KB/s。用户批准采用 core-only runtime-JIT；本修订覆盖本文后续任何旧的
+JIT-cache/AOT-cache 描述：
+
+- 依赖固定为 `flashinfer_python==0.6.15.dev20260716`，不使用 `[cu13]` extra；
+- 只下载并校验 core wheel，不安装 `flashinfer-jit-cache`；
+- 若新的 Stage B venv 中有旧流程残留的 JIT-cache，只从该新 venv 卸载；
+- `smoke-no-jit.status` 预期非零，仅保留为诊断证据；
+- 第一次正常 smoke 使用 CUDA 13.0 NVCC runtime-JIT，第二次验证缓存复用；
+- manifest 中 `packages.flashinfer-jit-cache` 预期为 `null`。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 在不修改旧 venv 的前提下，为 fork SGLang 建立可复现的 CUDA 13.0 实验环境，并在 RTX PRO 5000 上完成 FlashInfer `moe_gemm_fp8_nt_groupwise` 的独立正确性与缓存预热验证。
@@ -14,9 +27,9 @@
 - 服务器根目录固定为 `/home/logs/sennian/pro5000-fi-moe`；repo、`.venv`、`wheelhouse`、`cache` 和 `runs` 必须互相隔离。
 - 旧环境 `/home/logs/sennian/py-venv/sglang5.14` 不得写入、升级或删除。
 - `flashinfer-python` 固定为 `0.6.15.dev20260716`，core wheel SHA256 固定为 `ed0634d9c32f069dafe7583addf74de7a4f366ae07d3093250109bd315b4ba26`。
-- `flashinfer-jit-cache` 固定为 `0.6.15.dev20260716+cu130`，wheel SHA256 固定为 `86a0944b4cadde0a4227f249e5a0fe466207d7c25e8eb7dee4c3f75fdd5f9bbf`。
-- 正常运行不得设置 `FLASHINFER_DISABLE_JIT`；该变量只用于一次可选 AOT-cache 诊断。
-- runtime-JIT fallback 必须使用服务器已有 NVCC 13.0.48，并把 cache 放在持久化根目录下。
+- 不安装可选的 `flashinfer-jit-cache`；collector 保留该字段以证明值为 `null`。
+- 正常运行不得设置 `FLASHINFER_DISABLE_JIT`；该变量只用于一次可选 no-JIT 诊断。
+- runtime-JIT 必须使用服务器已有 NVCC 13.0.48，并把 cache 放在持久化根目录下。
 - Stage B 不修改 FlashInfer kernel、不接入 MoE runner、不安装 `flashinfer-cubin`。
 - 本地无法代表 RTX PRO 5000 CUDA 环境；GPU smoke 的通过证据必须来自用户返回的服务器输出。
 - 每个任务都先写失败测试、确认失败原因、做最小实现、重新验证并单独提交。
@@ -44,7 +57,7 @@
 
 **Interfaces:**
 - Consumes: Python 3.11+ 标准库 `tomllib`。
-- Produces: SGLang 安装元数据中的精确依赖字符串 `flashinfer_python[cu13]==0.6.15.dev20260716`。
+- Produces: SGLang 安装元数据中的精确依赖字符串 `flashinfer_python==0.6.15.dev20260716`。
 
 - [ ] **Step 1: 写依赖 pin 失败测试**
 
@@ -69,7 +82,7 @@ PRO5000_SCRIPTS = REPO_ROOT / "scripts" / "pro5000"
 def test_flashinfer_nightly_dependency_is_pinned() -> None:
     data = tomllib.loads(PYPROJECT.read_text())
     assert (
-        "flashinfer_python[cu13]==0.6.15.dev20260716"
+        "flashinfer_python==0.6.15.dev20260716"
         in data["project"]["dependencies"]
     )
 ```
@@ -91,7 +104,7 @@ Expected: FAIL；依赖列表仍包含 `flashinfer_python[cu13]==0.6.15`。
 把 `python/pyproject.toml` 中对应行改为：
 
 ```toml
-  "flashinfer_python[cu13]==0.6.15.dev20260716", # keep it aligned with the Stage B jit-cache wheel
+  "flashinfer_python==0.6.15.dev20260716", # Stage B uses the server NVCC for runtime JIT
 ```
 
 - [ ] **Step 4: 重新运行测试**
@@ -593,7 +606,7 @@ git commit -m "chore: add Stage B environment manifest collector"
 在测试文件追加：
 
 ```python
-def test_bootstrap_shell_syntax_and_fixed_artifacts() -> None:
+def test_bootstrap_uses_core_only_runtime_jit() -> None:
     script = PRO5000_SCRIPTS / "bootstrap_stage_b.sh"
     completed = subprocess.run(
         ["bash", "-n", str(script)], text=True, capture_output=True
@@ -603,7 +616,8 @@ def test_bootstrap_shell_syntax_and_fixed_artifacts() -> None:
     assert "/home/logs/sennian/pro5000-fi-moe" in content
     assert "0.6.15.dev20260716" in content
     assert "ed0634d9c32f069dafe7583addf74de7a4f366ae07d3093250109bd315b4ba26" in content
-    assert "86a0944b4cadde0a4227f249e5a0fe466207d7c25e8eb7dee4c3f75fdd5f9bbf" in content
+    assert "flashinfer_jit_cache" not in content
+    assert "86a0944b4cadde0a4227f249e5a0fe466207d7c25e8eb7dee4c3f75fdd5f9bbf" not in content
     assert "FLASHINFER_DISABLE_JIT=1" in content
     assert "--real-shapes" in content
     assert "nvidia-cutlass-dsl-libs-cu13==4.5.2" in content
@@ -642,9 +656,6 @@ EXPECTED_REPO="${PRO5000_ROOT}/sglang"
 CORE_NAME="flashinfer_python-0.6.15.dev20260716-py3-none-any.whl"
 CORE_URL="https://github.com/flashinfer-ai/flashinfer/releases/download/nightly-v0.6.15-20260716/flashinfer_python-0.6.15.dev20260716-py3-none-any.whl"
 CORE_SHA256="ed0634d9c32f069dafe7583addf74de7a4f366ae07d3093250109bd315b4ba26"
-JIT_NAME="flashinfer_jit_cache-0.6.15.dev20260716+cu130-cp39-abi3-manylinux_2_28_x86_64.whl"
-JIT_URL="https://github.com/flashinfer-ai/flashinfer/releases/download/nightly-v0.6.15-20260716/flashinfer_jit_cache-0.6.15.dev20260716%2Bcu130-cp39-abi3-manylinux_2_28_x86_64.whl"
-JIT_SHA256="86a0944b4cadde0a4227f249e5a0fe466207d7c25e8eb7dee4c3f75fdd5f9bbf"
 
 require_command() {
   local command_name="$1"
@@ -702,7 +713,6 @@ fi
 
 mkdir -p "${WHEELHOUSE}" "${CACHE_DIR}" "${RUNS_DIR}"
 download_verified "${CORE_URL}" "${WHEELHOUSE}/${CORE_NAME}" "${CORE_SHA256}"
-download_verified "${JIT_URL}" "${WHEELHOUSE}/${JIT_NAME}" "${JIT_SHA256}"
 
 if [[ ! -x "${VENV_DIR}/bin/python3" ]]; then
   uv venv --python 3.12 --seed "${VENV_DIR}"
@@ -717,7 +727,7 @@ export UV_CACHE_DIR="${CACHE_DIR}/uv"
 export FLASHINFER_WORKSPACE_BASE="${CACHE_DIR}/flashinfer-workspace-base"
 
 uv pip install --python "${PYTHON}" \
-  "${WHEELHOUSE}/${CORE_NAME}" "${WHEELHOUSE}/${JIT_NAME}"
+  "${WHEELHOUSE}/${CORE_NAME}"
 uv pip install --python "${PYTHON}" \
   --prerelease=allow \
   --index-strategy unsafe-best-match \
@@ -728,17 +738,21 @@ uv pip install --python "${PYTHON}" --force-reinstall --no-deps \
   --index-url https://docs.sglang.ai/whl/cu130/ \
   sglang-kernel==0.4.4
 uv pip install --python "${PYTHON}" --force-reinstall --no-deps \
-  "${WHEELHOUSE}/${CORE_NAME}" "${WHEELHOUSE}/${JIT_NAME}"
+  "${WHEELHOUSE}/${CORE_NAME}"
 uv pip install --python "${PYTHON}" --force-reinstall --no-deps \
   nvidia-cutlass-dsl-libs-cu13==4.5.2
+
+if "${PYTHON}" -c 'import importlib.metadata; importlib.metadata.version("flashinfer-jit-cache")' \
+  >/dev/null 2>&1; then
+  uv pip uninstall --python "${PYTHON}" flashinfer-jit-cache
+fi
 
 RUN_ID="stage-b-$(date -u +%Y%m%dT%H%M%SZ)-$(git -C "${REPO_ROOT}" rev-parse --short=12 HEAD)"
 RUN_DIR="${RUNS_DIR}/${RUN_ID}"
 mkdir -p "${RUN_DIR}"
 
 "${PYTHON}" -m pip check >"${RUN_DIR}/pip-check.txt" 2>&1
-sha256sum "${WHEELHOUSE}/${CORE_NAME}" "${WHEELHOUSE}/${JIT_NAME}" \
-  >"${RUN_DIR}/wheel-sha256.txt"
+sha256sum "${WHEELHOUSE}/${CORE_NAME}" >"${RUN_DIR}/wheel-sha256.txt"
 "${PYTHON}" "${REPO_ROOT}/scripts/pro5000/collect_stage_b_env.py" \
   >"${RUN_DIR}/environment.json"
 
@@ -866,8 +880,8 @@ find /home/logs/sennian/pro5000-fi-moe/runs -maxdepth 2 -type f \
   -print -exec sed -n '1,240p' {} \;
 ```
 
-把上述输出完整返回。`smoke-no-jit.status` 为非零只表示官方 AOT cache 未命中；
-只要两次 `smoke-normal-*.json` 都生成且 `calc_diff < 1e-3`，Stage B 仍可使用
+把上述输出完整返回。由于不安装 JIT-cache，`smoke-no-jit.status` 预期非零；
+只要两次 `smoke-normal-*.json` 都生成且 `calc_diff < 1e-3`，Stage B 使用
 NVCC runtime-JIT 模式继续验收。
 ````
 
@@ -929,7 +943,7 @@ from pathlib import Path
 
 data = tomllib.loads(Path("python/pyproject.toml").read_text())
 pins = [x for x in data["project"]["dependencies"] if x.startswith("flashinfer_python")]
-assert pins == ["flashinfer_python[cu13]==0.6.15.dev20260716"], pins
+assert pins == ["flashinfer_python==0.6.15.dev20260716"], pins
 print(pins[0])
 PY
 ```
@@ -954,12 +968,12 @@ environment-after-smoke.json:
   python.venv == true
   packages.torch 以 2.11.0 开头
   packages.flashinfer-python == 0.6.15.dev20260716
-  packages.flashinfer-jit-cache 以 0.6.15.dev20260716+cu130 开头
+  packages.flashinfer-jit-cache == null
   cuda.torch_cuda == 13.0
   cuda.compute_capability == [12, 0]
 
 wheel-sha256.txt:
-  两个哈希分别精确匹配 Global Constraints
+  core wheel 哈希精确匹配 Global Constraints
 
 smoke-normal-first.json 和 smoke-normal-second.json:
   三个 case 均存在
@@ -972,9 +986,9 @@ smoke-normal-first.json 和 smoke-normal-second.json:
 
 ```text
 Stage B: PASS
-mode: AOT-cache（smoke-no-jit.status 为 0）或 runtime-JIT（非 0）
+mode: runtime-JIT（smoke-no-jit.status 预期非 0）
 git_sha: 服务器 environment-after-smoke.json 中的 git.commit
 ```
 
 若 required normal smoke 失败，不修改 runner；保留 `runs/stage-b-*` 证据并进入
-systematic-debugging，按首次失败栈定位依赖、AOT 模块或 NVCC 编译问题。
+systematic-debugging，按首次失败栈定位依赖或 NVCC 编译问题。

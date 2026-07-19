@@ -31,7 +31,7 @@ dependencies = [
   "einops",
   "fastapi",
   "flash-attn-4==4.0.0b15",
-  "flashinfer_python[cu13]==0.6.15.dev20260716", # keep it aligned with the Stage B jit-cache wheel
+  "flashinfer_python==0.6.15.dev20260716", # Stage B uses the server NVCC for runtime JIT
   "gguf",
   "humming-kernels[cu13]==0.1.10",
   "interegular",

@@ -12,9 +12,6 @@ EXPECTED_REPO="${PRO5000_ROOT}/sglang"
 CORE_NAME="flashinfer_python-0.6.15.dev20260716-py3-none-any.whl"
 CORE_URL="https://github.com/flashinfer-ai/flashinfer/releases/download/nightly-v0.6.15-20260716/flashinfer_python-0.6.15.dev20260716-py3-none-any.whl"
 CORE_SHA256="ed0634d9c32f069dafe7583addf74de7a4f366ae07d3093250109bd315b4ba26"
-JIT_NAME="flashinfer_jit_cache-0.6.15.dev20260716+cu130-cp39-abi3-manylinux_2_28_x86_64.whl"
-JIT_URL="https://github.com/flashinfer-ai/flashinfer/releases/download/nightly-v0.6.15-20260716/flashinfer_jit_cache-0.6.15.dev20260716%2Bcu130-cp39-abi3-manylinux_2_28_x86_64.whl"
-JIT_SHA256="86a0944b4cadde0a4227f249e5a0fe466207d7c25e8eb7dee4c3f75fdd5f9bbf"
 
 require_command() {
   local command_name="$1"
@@ -72,7 +69,6 @@ fi
 
 mkdir -p "${WHEELHOUSE}" "${CACHE_DIR}" "${RUNS_DIR}"
 download_verified "${CORE_URL}" "${WHEELHOUSE}/${CORE_NAME}" "${CORE_SHA256}"
-download_verified "${JIT_URL}" "${WHEELHOUSE}/${JIT_NAME}" "${JIT_SHA256}"
 
 if [[ ! -x "${VENV_DIR}/bin/python3" ]]; then
   uv venv --python 3.12 --seed "${VENV_DIR}"
@@ -87,7 +83,7 @@ export UV_CACHE_DIR="${CACHE_DIR}/uv"
 export FLASHINFER_WORKSPACE_BASE="${CACHE_DIR}/flashinfer-workspace-base"
 
 uv pip install --python "${PYTHON}" \
-  "${WHEELHOUSE}/${CORE_NAME}" "${WHEELHOUSE}/${JIT_NAME}"
+  "${WHEELHOUSE}/${CORE_NAME}"
 uv pip install --python "${PYTHON}" \
   --prerelease=allow \
   --index-strategy unsafe-best-match \
@@ -98,17 +94,21 @@ uv pip install --python "${PYTHON}" --force-reinstall --no-deps \
   --index-url https://docs.sglang.ai/whl/cu130/ \
   sglang-kernel==0.4.4
 uv pip install --python "${PYTHON}" --force-reinstall --no-deps \
-  "${WHEELHOUSE}/${CORE_NAME}" "${WHEELHOUSE}/${JIT_NAME}"
+  "${WHEELHOUSE}/${CORE_NAME}"
 uv pip install --python "${PYTHON}" --force-reinstall --no-deps \
   nvidia-cutlass-dsl-libs-cu13==4.5.2
+
+if "${PYTHON}" -c 'import importlib.metadata; importlib.metadata.version("flashinfer-jit-cache")' \
+  >/dev/null 2>&1; then
+  uv pip uninstall --python "${PYTHON}" flashinfer-jit-cache
+fi
 
 RUN_ID="stage-b-$(date -u +%Y%m%dT%H%M%SZ)-$(git -C "${REPO_ROOT}" rev-parse --short=12 HEAD)"
 RUN_DIR="${RUNS_DIR}/${RUN_ID}"
 mkdir -p "${RUN_DIR}"
 
 "${PYTHON}" -m pip check >"${RUN_DIR}/pip-check.txt" 2>&1
-sha256sum "${WHEELHOUSE}/${CORE_NAME}" "${WHEELHOUSE}/${JIT_NAME}" \
-  >"${RUN_DIR}/wheel-sha256.txt"
+sha256sum "${WHEELHOUSE}/${CORE_NAME}" >"${RUN_DIR}/wheel-sha256.txt"
 "${PYTHON}" "${REPO_ROOT}/scripts/pro5000/collect_stage_b_env.py" \
   >"${RUN_DIR}/environment.json"
 

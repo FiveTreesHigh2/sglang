@@ -3,6 +3,11 @@
 这些命令只创建 `/home/logs/sennian/pro5000-fi-moe` 下的新环境，不修改旧环境
 `/home/logs/sennian/py-venv/sglang5.14`。
 
+该环境只安装精确版本的 `flashinfer-python` core，不安装 `flashinfer-jit-cache`。
+第一次正常 smoke 使用服务器 CUDA 13.0 NVCC runtime-JIT 编译目标 kernel，第二次
+正常 smoke 验证持久化编译缓存能够复用。如果新的 Stage B `.venv` 中已有旧版
+bootstrap 遗留的 JIT-cache，脚本只从这个新 venv 卸载它，不触碰旧环境。
+
 ## 首次 clone 并固定当前 feature commit
 
 ```bash
@@ -19,6 +24,17 @@ git status --short --branch
 `git status --short --branch` 可以显示 detached HEAD 的 `## HEAD (no branch)`；除此
 之外不得有文件状态行。记录 `git rev-parse HEAD` 输出的完整 SHA。
 
+## 已有 clone 更新到最新 feature commit
+
+```bash
+cd /home/logs/sennian/pro5000-fi-moe/sglang
+test -z "$(git status --porcelain)"
+git fetch origin feat/flashinfer-sm120-fp8-moe
+git switch --detach origin/feat/flashinfer-sm120-fp8-moe
+git rev-parse HEAD
+git status --short --branch
+```
+
 ## 执行 bootstrap
 
 ```bash
@@ -34,6 +50,6 @@ find /home/logs/sennian/pro5000-fi-moe/runs -maxdepth 2 -type f \
   -print -exec sed -n '1,240p' {} \;
 ```
 
-把上述输出完整返回。`smoke-no-jit.status` 为非零只表示官方 AOT cache 未命中；
-只要两次 `smoke-normal-*.json` 都生成且 `calc_diff < 1e-3`，Stage B 仍可使用
-NVCC runtime-JIT 模式继续验收。
+把上述输出完整返回。由于没有安装 JIT-cache，`smoke-no-jit.status` 预期为非零，
+它只是诊断记录，不阻塞验收。两次 `smoke-normal-*.json` 都必须生成，并且每个
+case 都必须满足 `calc_diff < 1e-3`。
