@@ -43,3 +43,26 @@ def test_smoke_padded_offset_contract() -> None:
 def test_smoke_csr_offsets_include_empty_experts() -> None:
     smoke = _load_script_module("flashinfer_sm120_fp8_smoke.py")
     assert smoke.build_offsets([0, 8, 0, 3]) == [0, 0, 8, 8, 11]
+
+
+def test_environment_collector_emits_required_schema() -> None:
+    script = PRO5000_SCRIPTS / "collect_stage_b_env.py"
+    completed = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=REPO_ROOT,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    payload = json.loads(completed.stdout)
+    assert set(payload) >= {
+        "timestamp_utc",
+        "platform",
+        "git",
+        "python",
+        "packages",
+        "cuda",
+        "environment",
+    }
+    assert set(payload["git"]) >= {"commit", "branch", "dirty"}
+    assert "HF_TOKEN" not in payload["environment"]
