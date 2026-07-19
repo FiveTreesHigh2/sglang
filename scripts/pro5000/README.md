@@ -16,7 +16,8 @@ git rev-parse HEAD
 git status --short --branch
 ```
 
-`git status` 必须为空；记录 `git rev-parse HEAD` 输出的完整 SHA。
+`git status --short --branch` 可以显示 detached HEAD 的 `## HEAD (no branch)`；除此
+之外不得有文件状态行。记录 `git rev-parse HEAD` 输出的完整 SHA。
 
 ## 执行 bootstrap
 
