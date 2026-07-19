@@ -36,7 +36,11 @@ chunked-prefill 工作负载下测得的 Triton 基线如下：
 | --- | --- | ---: |
 | GEMM1 / w13 | M=65536, N=1024, K=2048 | 1.267 ms |
 | GEMM2 / w2 | M=65536, N=2048, K=512 | 0.794 ms |
-| 40 层 routed MoE 合计 | chunk size 8192 | 约 82 ms |
+| 40 层两次 Triton expert GEMM 推算合计 | `(1.267 + 0.794) × 40` | 约 82.44 ms |
+
+前两项来自原始计划记录的锁频 NCU `耗时/launch`。最后一项是两次 GEMM 延迟
+在 40 层上的算术推算，不是包含路由、量化、激活、combine 和 shared expert 的
+完整 routed-MoE 实测时间。
 
 FlashInfer 目标入口使用相同的权重量化粒度，并采用 token-packed zero-padding
 模式，从而避免 Triton 路径中的 expert `BLOCK_M` 激活 padding。
