@@ -71,7 +71,7 @@ mkdir -p "${WHEELHOUSE}" "${CACHE_DIR}" "${RUNS_DIR}"
 download_verified "${CORE_URL}" "${WHEELHOUSE}/${CORE_NAME}" "${CORE_SHA256}"
 
 if [[ ! -x "${VENV_DIR}/bin/python3" ]]; then
-  uv venv --python 3.12 --seed "${VENV_DIR}"
+  uv venv --python 3.12 "${VENV_DIR}"
 fi
 PYTHON="${VENV_DIR}/bin/python3"
 if [[ "$("${PYTHON}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" != "3.12" ]]; then
@@ -84,14 +84,12 @@ export FLASHINFER_WORKSPACE_BASE="${CACHE_DIR}/flashinfer-workspace-base"
 # Stage B does not use --grpc-port; skip the optional native gRPC Rust extension.
 export SGLANG_BUILD_RUST_EXTS="none"
 
-uv pip install --python "${PYTHON}" \
-  -i https://pypi.tuna.tsinghua.edu.cn/simple \
-  "${WHEELHOUSE}/${CORE_NAME}"
+# Resolve FlashInfer together with SGLang so the pinned cu13 CUTLASS stack wins.
 uv pip install --python "${PYTHON}" \
   --index https://pypi.tuna.tsinghua.edu.cn/simple \
   --index https://docs.sglang.ai/whl/cu130/ \
   --index-strategy first-index \
-  --prerelease=allow \
+  --prerelease=if-necessary-or-explicit \
   --find-links "${WHEELHOUSE}" \
   -e "${REPO_ROOT}/python"
 uv pip install --python "${PYTHON}" --force-reinstall --no-deps \
@@ -112,7 +110,11 @@ RUN_ID="stage-b-$(date -u +%Y%m%dT%H%M%SZ)-$(git -C "${REPO_ROOT}" rev-parse --s
 RUN_DIR="${RUNS_DIR}/${RUN_ID}"
 mkdir -p "${RUN_DIR}"
 
-"${PYTHON}" -m pip check >"${RUN_DIR}/pip-check.txt" 2>&1
+if ! uv pip check --python "${PYTHON}" >"${RUN_DIR}/pip-check.txt" 2>&1; then
+  echo "ERROR: dependency check failed; details follow:" >&2
+  cat "${RUN_DIR}/pip-check.txt" >&2
+  exit 1
+fi
 sha256sum "${WHEELHOUSE}/${CORE_NAME}" >"${RUN_DIR}/wheel-sha256.txt"
 "${PYTHON}" "${REPO_ROOT}/scripts/pro5000/collect_stage_b_env.py" \
   >"${RUN_DIR}/environment.json"

@@ -83,7 +83,7 @@ def test_bootstrap_uses_core_only_runtime_jit() -> None:
     assert "86a0944b4cadde0a4227f249e5a0fe466207d7c25e8eb7dee4c3f75fdd5f9bbf" not in content
     assert 'importlib.metadata.version("flashinfer-jit-cache")' in content
     assert 'uv pip uninstall --python "${PYTHON}" flashinfer-jit-cache' in content
-    assert content.count("-i https://pypi.tuna.tsinghua.edu.cn/simple") == 3
+    assert content.count("-i https://pypi.tuna.tsinghua.edu.cn/simple") == 2
     tsinghua_index = "--index https://pypi.tuna.tsinghua.edu.cn/simple"
     sglang_index = "--index https://docs.sglang.ai/whl/cu130/"
     assert tsinghua_index in content
@@ -92,11 +92,41 @@ def test_bootstrap_uses_core_only_runtime_jit() -> None:
     assert "--index-strategy first-index" in content
     assert "--index-strategy unsafe-best-match" not in content
     assert "--extra-index-url" not in content
+    assert "--prerelease=if-necessary-or-explicit" in content
+    assert "--prerelease=allow" not in content
     assert "FLASHINFER_DISABLE_JIT=1" in content
     assert "--real-shapes" in content
     assert "nvidia-cutlass-dsl-libs-cu13==4.5.2" in content
     assert "rm -rf" not in content
     assert "/home/logs/sennian/py-venv/sglang5.14" not in content
+
+
+def test_bootstrap_resolves_flashinfer_with_sglang_dependency_set() -> None:
+    script = PRO5000_SCRIPTS / "bootstrap_stage_b.sh"
+    content = script.read_text()
+    eager_install = """uv pip install --python "${PYTHON}" \\
+  -i https://pypi.tuna.tsinghua.edu.cn/simple \\
+  "${WHEELHOUSE}/${CORE_NAME}"""  # This would resolve unpinned CUTLASS first.
+
+    assert eager_install not in content
+    assert '--find-links "${WHEELHOUSE}"' in content
+
+
+def test_bootstrap_uses_uv_pip_without_seeded_pip() -> None:
+    script = PRO5000_SCRIPTS / "bootstrap_stage_b.sh"
+    content = script.read_text()
+
+    assert "uv venv --python 3.12 --seed" not in content
+    assert '"${PYTHON}" -m pip' not in content
+    assert 'uv pip check --python "${PYTHON}"' in content
+
+
+def test_bootstrap_surfaces_uv_dependency_check_failures() -> None:
+    script = PRO5000_SCRIPTS / "bootstrap_stage_b.sh"
+    content = script.read_text()
+
+    assert 'if ! uv pip check --python "${PYTHON}"' in content
+    assert 'cat "${RUN_DIR}/pip-check.txt" >&2' in content
 
 
 def test_bootstrap_installs_sglang_kernel_from_tsinghua() -> None:
@@ -129,6 +159,9 @@ def test_stage_b_readme_preserves_old_environment_and_uses_detached_checkout() -
     assert "NVCC runtime-JIT" in readme
     assert "安装中断后可直接重新运行" in readme
     assert "first-index" in readme
+    assert "所有包安装、卸载和依赖检查都使用 `uv pip --python`" in readme
+    assert "不要在这个 venv 中执行 `pip` 或 `python -m pip`" in readme
+    assert ".venv-before-clean-resolve" in readme
     assert "`sglang-kernel==0.4.4` 从清华 PyPI 镜像显式安装" in readme
     assert "最终仍从 SGLang CUDA 13.0 专用源强制安装" not in readme
     assert "rm -rf" not in readme
