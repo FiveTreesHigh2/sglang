@@ -86,10 +86,10 @@ uv pip install --python "${PYTHON}" \
   -i https://pypi.tuna.tsinghua.edu.cn/simple \
   "${WHEELHOUSE}/${CORE_NAME}"
 uv pip install --python "${PYTHON}" \
-  -i https://pypi.tuna.tsinghua.edu.cn/simple \
+  --index https://pypi.tuna.tsinghua.edu.cn/simple \
+  --index https://docs.sglang.ai/whl/cu130/ \
+  --index-strategy first-index \
   --prerelease=allow \
-  --index-strategy unsafe-best-match \
-  --extra-index-url https://docs.sglang.ai/whl/cu130/ \
   --find-links "${WHEELHOUSE}" \
   -e "${REPO_ROOT}/python"
 uv pip install --python "${PYTHON}" --force-reinstall --no-deps \
