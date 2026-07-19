@@ -84,3 +84,11 @@ def test_bootstrap_shell_syntax_and_fixed_artifacts() -> None:
     assert "nvidia-cutlass-dsl-libs-cu13==4.5.2" in content
     assert "rm -rf" not in content
     assert "/home/logs/sennian/py-venv/sglang5.14" not in content
+
+
+def test_stage_b_readme_preserves_old_environment_and_uses_detached_checkout() -> None:
+    readme = (PRO5000_SCRIPTS / "README.md").read_text()
+    assert "/home/logs/sennian/py-venv/sglang5.14" in readme
+    assert "git switch --detach origin/feat/flashinfer-sm120-fp8-moe" in readme
+    assert "bash scripts/pro5000/bootstrap_stage_b.sh" in readme
+    assert "rm -rf" not in readme
