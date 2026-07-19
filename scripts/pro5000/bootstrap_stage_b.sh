@@ -81,6 +81,8 @@ fi
 
 export UV_CACHE_DIR="${CACHE_DIR}/uv"
 export FLASHINFER_WORKSPACE_BASE="${CACHE_DIR}/flashinfer-workspace-base"
+# Stage B does not use --grpc-port; skip the optional native gRPC Rust extension.
+export SGLANG_BUILD_RUST_EXTS="none"
 
 uv pip install --python "${PYTHON}" \
   -i https://pypi.tuna.tsinghua.edu.cn/simple \

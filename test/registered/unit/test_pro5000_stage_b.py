@@ -100,6 +100,16 @@ def test_bootstrap_uses_core_only_runtime_jit() -> None:
     assert "/home/logs/sennian/py-venv/sglang5.14" not in content
 
 
+def test_bootstrap_disables_unused_rust_extension_before_editable_install() -> None:
+    script = PRO5000_SCRIPTS / "bootstrap_stage_b.sh"
+    content = script.read_text()
+    rust_opt_out = 'export SGLANG_BUILD_RUST_EXTS="none"'
+    editable_install = '-e "${REPO_ROOT}/python"'
+
+    assert rust_opt_out in content
+    assert content.index(rust_opt_out) < content.index(editable_install)
+
+
 def test_stage_b_readme_preserves_old_environment_and_uses_detached_checkout() -> None:
     readme = (PRO5000_SCRIPTS / "README.md").read_text()
     assert "/home/logs/sennian/py-venv/sglang5.14" in readme
