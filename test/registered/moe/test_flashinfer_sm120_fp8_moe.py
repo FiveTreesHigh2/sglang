@@ -118,3 +118,98 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
             ),
         )
         self.assertEqual(actual_gemm1.data_ptr() % 16, 0)
+
+    def test_layout_covers_topk_and_empty_expert_profiles(self):
+        from sglang.kernels.ops.moe.flashinfer_sm120_fp8 import (
+            pack_flashinfer_sm120_fp8_scale,
+        )
+
+        experts, tokens = 8, 8
+        for top_k in (1, 2, 8):
+            with self.subTest(top_k=top_k):
+                topk_ids = (
+                    torch.arange(
+                        tokens * top_k,
+                        device="cuda",
+                        dtype=torch.int32,
+                    )
+                    .remainder(experts - 1)
+                    .view(tokens, top_k)
+                )
+                _, src2dst, m_indptr = moe_permute(
+                    torch.zeros(
+                        tokens,
+                        128,
+                        device="cuda",
+                        dtype=torch.float8_e4m3fn,
+                    ),
+                    topk_ids,
+                    experts,
+                )
+                source = torch.arange(
+                    tokens * 2, device="cuda", dtype=torch.float32
+                ).view(tokens, 2)
+                actual = pack_flashinfer_sm120_fp8_scale(
+                    source,
+                    topk_ids,
+                    src2dst,
+                    m_indptr,
+                    source_is_packed=False,
+                )
+                expected = _layout_reference(
+                    source, topk_ids, src2dst, m_indptr, False
+                )
+                torch.testing.assert_close(actual, expected)
+
+    def test_reused_out_clears_padding_after_route_change(self):
+        from sglang.kernels.ops.moe.flashinfer_sm120_fp8 import (
+            pack_flashinfer_sm120_fp8_scale,
+        )
+
+        experts = 8
+        route_a = torch.tensor(
+            [[0, 0], [0, 1], [1, 1], [1, 1]],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        route_b = torch.tensor(
+            [[7, 7], [6, 7], [5, 6], [4, 7]],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        source = torch.arange(
+            8, device="cuda", dtype=torch.float32
+        ).view(4, 2)
+        out = None
+        for topk_ids in (route_a, route_b):
+            _, src2dst, m_indptr = moe_permute(
+                torch.zeros(
+                    (4, 128),
+                    device="cuda",
+                    dtype=torch.float8_e4m3fn,
+                ),
+                topk_ids,
+                experts,
+            )
+            if out is None:
+                out = pack_flashinfer_sm120_fp8_scale(
+                    source,
+                    topk_ids,
+                    src2dst,
+                    m_indptr,
+                    source_is_packed=False,
+                )
+            else:
+                pack_flashinfer_sm120_fp8_scale(
+                    source,
+                    topk_ids,
+                    src2dst,
+                    m_indptr,
+                    source_is_packed=False,
+                    out=out,
+                )
+
+        expected = _layout_reference(
+            source, route_b, src2dst, m_indptr, False
+        )
+        torch.testing.assert_close(out, expected)
