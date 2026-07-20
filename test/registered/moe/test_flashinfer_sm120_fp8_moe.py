@@ -123,6 +123,21 @@ def _calc_diff(actual, expected):
     return float((numerator / denominator).item())
 
 
+def _calc_symmetric_diff(actual, expected):
+    actual = actual.double()
+    expected = expected.double()
+    denominator = (
+        (actual.square() + expected.square()).sum().clamp_min(1e-24)
+    )
+    return float((1.0 - 2.0 * (actual * expected).sum() / denominator).item())
+
+
+def _calc_normalized_rmse(actual, expected):
+    error_rms = (actual.float() - expected.float()).square().mean().sqrt()
+    expected_rms = expected.float().square().mean().sqrt().clamp_min(1e-12)
+    return float((error_rms / expected_rms).item())
+
+
 def _grouped_fp32_reference(a, b, a_scale, b_scale, m_indptr):
     boundaries = m_indptr.cpu().tolist()
     num_experts = len(boundaries) - 1
@@ -415,6 +430,7 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
         torch.testing.assert_close(out, expected)
 
     def test_full_runner_correctness(self):
+        strict_failures = []
         cases = [
             (1, 1, torch.tensor([[0]], device="cuda", dtype=torch.int32)),
             (
@@ -471,18 +487,25 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
                     w2_scale,
                 )
                 full_diff = _calc_diff(actual, expected)
+                symmetric_diff = _calc_symmetric_diff(actual, expected)
+                normalized_rmse = _calc_normalized_rmse(actual, expected)
                 print(
                     "[diagnostic] "
                     f"tokens={tokens} top_k={top_k} "
                     f"gemm1_direct={stage_diagnostics[0]} "
                     f"gemm2_direct={stage_diagnostics[1]} "
                     f"full_vs_triton={full_diff:.6e} "
+                    f"symmetric_diff={symmetric_diff:.6e} "
+                    f"normalized_rmse={normalized_rmse:.6e} "
                     f"actual_abs_mean={actual.float().abs().mean().item():.6e} "
                     f"triton_abs_mean={expected.float().abs().mean().item():.6e}"
                 )
                 self.assertTrue(bool(torch.isfinite(actual).all()))
-                self.assertLess(
-                    full_diff,
-                    1e-3,
-                    msg=f"tokens={tokens} top_k={top_k}",
-                )
+                if full_diff >= 1e-3:
+                    strict_failures.append(
+                        f"tokens={tokens} top_k={top_k} "
+                        f"mean_abs_relative={full_diff:.6e} "
+                        f"symmetric_diff={symmetric_diff:.6e} "
+                        f"normalized_rmse={normalized_rmse:.6e}"
+                    )
+        self.assertFalse(strict_failures, "\n".join(strict_failures))
