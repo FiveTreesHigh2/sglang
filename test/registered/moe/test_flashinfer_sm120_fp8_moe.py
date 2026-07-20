@@ -538,3 +538,104 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
             correctness_failures,
             "\n".join(correctness_failures),
         )
+
+    def test_cuda_graph_replays_new_hidden_and_routing(self):
+        from sglang.srt.layers.moe.moe_runner.flashinfer_sm120_fp8 import (
+            fused_experts_none_to_flashinfer_sm120_fp8,
+        )
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            StandardDispatchOutput,
+        )
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+        tokens, top_k = 8, 8
+        route_a = (
+            torch.arange(8, device="cuda", dtype=torch.int32)
+            .view(1, 8)
+            .expand(tokens, 8)
+            .clone()
+        )
+        route_b = (
+            torch.arange(8, 16, device="cuda", dtype=torch.int32)
+            .view(1, 8)
+            .expand(tokens, 8)
+            .clone()
+        )
+        dispatch, config, quant_info, _, _ = _make_runner_case(
+            tokens,
+            top_k,
+            route_a.clone(),
+        )
+        static_x = dispatch.hidden_states
+        static_ids = dispatch.topk_output.topk_ids
+        static_weights = dispatch.topk_output.topk_weights
+        static_dispatch = StandardDispatchOutput(
+            static_x,
+            None,
+            StandardTopKOutput(
+                static_weights,
+                static_ids,
+                dispatch.topk_output.router_logits,
+            ),
+        )
+
+        # Warm every JIT module and the shared FlashInfer .so before capture.
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(2):
+                fused_experts_none_to_flashinfer_sm120_fp8(
+                    static_dispatch,
+                    quant_info,
+                    config,
+                )
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = fused_experts_none_to_flashinfer_sm120_fp8(
+                static_dispatch,
+                quant_info,
+                config,
+            ).hidden_states
+        captured_output_ptr = graph_output.data_ptr()
+
+        inputs = (
+            (torch.randn_like(static_x) / 8, route_a),
+            (torch.randn_like(static_x) / 8, route_b),
+        )
+        for new_x, new_ids in inputs:
+            static_x.copy_(new_x)
+            static_ids.copy_(new_ids)
+            static_weights.fill_(1.0 / top_k)
+            graph.replay()
+            torch.cuda.synchronize()
+            replayed = graph_output.clone()
+
+            eager_dispatch = StandardDispatchOutput(
+                new_x,
+                None,
+                StandardTopKOutput(
+                    static_weights.clone(),
+                    new_ids,
+                    torch.empty(0, device="cuda"),
+                ),
+            )
+            eager = fused_experts_none_to_flashinfer_sm120_fp8(
+                eager_dispatch,
+                quant_info,
+                config,
+            ).hidden_states
+            torch.cuda.synchronize()
+
+            self.assertEqual(graph_output.data_ptr(), captured_output_ptr)
+            self.assertTrue(bool(torch.isfinite(replayed).all()))
+            torch.testing.assert_close(replayed, eager, rtol=0, atol=0)
+
+        torch.cuda.synchronize()
+        allocated_before = torch.cuda.memory_allocated()
+        for _ in range(20):
+            graph.replay()
+        torch.cuda.synchronize()
+        allocated_after = torch.cuda.memory_allocated()
+        self.assertEqual(allocated_after, allocated_before)
