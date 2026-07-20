@@ -32,6 +32,119 @@ def _layout_reference(source, topk_ids, src2dst, m_indptr, source_is_packed):
     return result
 
 
+def _make_runner_case(tokens, top_k, topk_ids, seed=11):
+    from flashinfer.testing.utils import per_block_cast_to_fp8
+    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+    from sglang.srt.layers.moe.moe_runner.flashinfer_sm120_fp8 import (
+        FlashInferSm120Fp8MoeQuantInfo,
+        prepare_flashinfer_sm120_fp8_weight_scales,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import (
+        StandardDispatchOutput,
+    )
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+    torch.manual_seed(seed)
+    experts, hidden, intermediate = 8, 256, 256
+    x = (
+        torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+        / 8
+    )
+    w13_bf16 = torch.randn(
+        experts,
+        2 * intermediate,
+        hidden,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) / hidden**0.5
+    w2_bf16 = torch.randn(
+        experts,
+        hidden,
+        intermediate,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) / intermediate**0.5
+
+    def quantize(weight):
+        quantized_parts = []
+        scale_parts = []
+        for expert in range(weight.shape[0]):
+            quantized, scale = per_block_cast_to_fp8(weight[expert])
+            quantized_parts.append(quantized)
+            scale_parts.append(scale)
+        return (
+            torch.stack(quantized_parts).contiguous(),
+            torch.stack(scale_parts).contiguous(),
+        )
+
+    w13, w13_scale = quantize(w13_bf16)
+    w2, w2_scale = quantize(w2_bf16)
+    w13_scale_fi, w2_scale_fi = prepare_flashinfer_sm120_fp8_weight_scales(
+        w13_scale,
+        w2_scale,
+    )
+    topk_weights = torch.rand(
+        tokens, top_k, device="cuda", dtype=torch.float32
+    )
+    topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
+    topk_output = StandardTopKOutput(
+        topk_weights,
+        topk_ids,
+        torch.empty(0, device="cuda"),
+    )
+    dispatch = StandardDispatchOutput(x, None, topk_output)
+    config = MoeRunnerConfig(
+        num_experts=experts,
+        num_local_experts=experts,
+        hidden_size=hidden,
+        intermediate_size_per_partition=intermediate,
+        top_k=top_k,
+        params_dtype=torch.bfloat16,
+        activation="silu",
+        is_gated=True,
+        inplace=False,
+        routed_scaling_factor=1.0,
+    )
+    quant_info = FlashInferSm120Fp8MoeQuantInfo(
+        w13,
+        w2,
+        w13_scale_fi,
+        w2_scale_fi,
+        (128, 128),
+    )
+    return dispatch, config, quant_info, w13_scale, w2_scale
+
+
+def _calc_diff(actual, expected):
+    numerator = (actual.float() - expected.float()).abs().mean()
+    denominator = expected.float().abs().mean().clamp_min(1e-12)
+    return float((numerator / denominator).item())
+
+
+def _run_triton_reference(
+    dispatch,
+    config,
+    quant_info,
+    w13_scale,
+    w2_scale,
+):
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+        fused_experts,
+    )
+
+    return fused_experts(
+        dispatch.hidden_states.clone(),
+        quant_info.w13_weight,
+        quant_info.w2_weight,
+        dispatch.topk_output,
+        config,
+        use_fp8_w8a8=True,
+        w1_scale=w13_scale,
+        w2_scale=w2_scale,
+        block_shape=[128, 128],
+    )
+
+
 @unittest.skipUnless(_IS_SM120, "SM120/SM121 required")
 class TestFlashInferSm120Fp8Packing(unittest.TestCase):
     def test_existing_moe_permute_copies_fp8_bits(self):
@@ -213,3 +326,64 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
             source, route_b, src2dst, m_indptr, False
         )
         torch.testing.assert_close(out, expected)
+
+    def test_full_runner_correctness(self):
+        from sglang.srt.layers.moe.moe_runner.flashinfer_sm120_fp8 import (
+            fused_experts_none_to_flashinfer_sm120_fp8,
+        )
+
+        cases = [
+            (1, 1, torch.tensor([[0]], device="cuda", dtype=torch.int32)),
+            (
+                8,
+                8,
+                torch.tensor(
+                    [
+                        [0, 0, 0, 1, 1, 2, 2, 7],
+                        [0, 0, 1, 1, 1, 2, 6, 7],
+                        [0, 1, 1, 2, 2, 2, 5, 7],
+                        [0, 0, 0, 0, 3, 3, 4, 7],
+                        [0, 1, 2, 3, 4, 5, 6, 7],
+                        [7, 7, 7, 6, 6, 5, 5, 4],
+                        [0, 0, 0, 0, 0, 0, 0, 7],
+                        [1, 2, 3, 4, 5, 6, 7, 7],
+                    ],
+                    device="cuda",
+                    dtype=torch.int32,
+                ),
+            ),
+            (
+                128,
+                2,
+                torch.arange(256, device="cuda", dtype=torch.int32)
+                .remainder(8)
+                .view(128, 2),
+            ),
+            (
+                1024,
+                8,
+                torch.arange(8192, device="cuda", dtype=torch.int32)
+                .square()
+                .remainder(8)
+                .view(1024, 8),
+            ),
+        ]
+        for tokens, top_k, topk_ids in cases:
+            with self.subTest(tokens=tokens, top_k=top_k):
+                dispatch, config, quant_info, w13_scale, w2_scale = (
+                    _make_runner_case(tokens, top_k, topk_ids)
+                )
+                actual = fused_experts_none_to_flashinfer_sm120_fp8(
+                    dispatch,
+                    quant_info,
+                    config,
+                ).hidden_states
+                expected = _run_triton_reference(
+                    dispatch,
+                    config,
+                    quant_info,
+                    w13_scale,
+                    w2_scale,
+                )
+                self.assertTrue(bool(torch.isfinite(actual).all()))
+                self.assertLess(_calc_diff(actual, expected), 1e-3)
