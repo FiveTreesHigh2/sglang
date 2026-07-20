@@ -171,11 +171,13 @@ N      intermediate size
 
 ```text
 hidden_states  [T, K]       BF16
-topk_ids       [T, top_k]   integer
+topk_ids       [T, top_k]   int32
 topk_weights   [T, top_k]   floating point
 ```
 
-`topk_ids/topk_weights` 完全来自现有 SGLang router。
+`topk_ids/topk_weights` 完全来自现有 SGLang router。runner 入口保证
+`topk_ids` 为 contiguous `int32`；现有 router 已满足时不产生转换或复制，不满足时
+在进入 `moe_permute_prepare` 前显式转换。
 
 ### 5.2 权重与 scale
 
@@ -200,7 +202,11 @@ w13_scale_fi [E, K/128, 2N/128]
 w2_scale_fi  [E, N/128, K/128]
 ```
 
-转换仅为 `transpose + contiguous`，在加载阶段执行一次。
+连续存储的 `w13_weight [E, 2N, K]` 和 `w2_weight [E, K, N]` 都是最后一维
+（对应各自 GEMM 的输入 K 维）连续，已经满足 FlashInfer `b [E, n, k]` 的 NT/
+column-major 契约。权重 payload 直接传入，不增加 transpose、copy 或重排。
+
+weight scale 的转换仅为 `transpose + contiguous`，在加载阶段执行一次。
 
 ### 5.3 `m_indptr`
 
@@ -231,6 +237,16 @@ m_indptr[e + 1] expert e 在 packed A 中的结束行
 
 本阶段 `M = T * top_k`，不存在多卡 EP 过滤后的无效 expert 行。
 
+对 `topk_ids.flatten()` 中的源 routed slot `r`：
+
+```text
+e   = topk_ids_flat[r]
+dst = src2dst[r]
+```
+
+`dst` 位于 expert `e` 的 `[m_indptr[e], m_indptr[e + 1])` 区间。因此后续 packing
+不需要在 `m_indptr` 上做 binary search，也不额外生成 per-row expert-id tensor。
+
 ### 6.2 GEMM1 输入：先量化一次，再打包
 
 不照抄 Humming grouped-contiguous 的“先复制 BF16，再量化”顺序。对于较大的
@@ -243,12 +259,24 @@ hidden_states [T, K] BF16
   -> per-token/per-128-K-group quant
 q_hidden      [T, K] FP8
 q_scale       [T, K/128] FP32
-  -> 使用同一 src2dst 分别打包 FP8 数据和 scale
+  -> 使用 src2dst 打包 FP8 payload
+  -> 使用 topk_ids_flat/src2dst/m_indptr 布局 scale
 packed_hidden [M, K] FP8
 a1_scale_fi   [K/128, M_padded] FP32
 ```
 
 FP8 数值和 scale 只改变排列，不进行第二次量化。
+
+FP8 payload 优先复用现有 `deepep_permute_triton_kernel`。该 kernel 的输出 dtype
+跟随输入，结构上允许 FP8，但在 SM120 上正式复用前必须用 bitwise 测试确认：
+
+- `torch.float8_e4m3fn` 能成功编译和执行；
+- 每个 routed slot 的 FP8 bit pattern 与 PyTorch reference 完全相同；
+- uniform、skew、空 expert 和 `top_k=1/2/8` 均正确。
+
+只有该验证失败时才新增 FP8 专用 gather kernel；不得未经测试就用 `int8 view`
+绕过 dtype，或默认现有 kernel 一定可用。scale 不经过该 permute kernel，统一由
+第 7 节的 layout op 处理。
 
 ### 6.3 FlashInfer GEMM1
 
@@ -344,20 +372,51 @@ packed_scale_start[e] = ((m_indptr[e] + 3 * e) // 4) * 4
 M_padded = ((M + 3 * E) // 4) * 4
 ```
 
-layout op 根据 `src2dst/m_indptr` 在 GPU 上完成：
+`M_padded` 只扩大 FP32 A-scale buffer，不扩大 FP8 activation A，也不改变 GEMM
+实际计算的 routed rows。FlashInfer 仍只计算 `M` 条有效行；小 decode 的潜在风险
+来自 quant、gather、layout 等固定 GPU launch 开销，而不是对 padding 行执行额外
+GEMM。
+
+layout op 根据 `topk_ids_flat/src2dst/m_indptr` 在 GPU 上完成：
 
 ```text
 row-major scales [source_rows, K_blocks]
   -> MN-major padded scales [K_blocks, M_padded]
 ```
 
+统一遍历源 routed slot `r`，计算：
+
+```text
+e            = topk_ids_flat[r]
+dst          = src2dst[r]
+local_row    = dst - m_indptr[e]
+aligned_base = ((m_indptr[e] + 3 * e) // 4) * 4
+output_col   = aligned_base + local_row
+```
+
+GEMM1 和 GEMM2 共用一个参数化实现，但源 scale 行的含义不同：
+
+| 调用 | 源 scale | `source_row` |
+| --- | --- | --- |
+| GEMM1 | `q_scale [T, K/128]`，原 token 顺序 | `r // top_k` |
+| GEMM2 | `down_scale [M, N/128]`，已是 expert-contiguous 顺序 | `dst` |
+
+实现使用编译期 mode 或两个薄 wrapper 选择 `source_row`，不为 GEMM2 创建 identity
+index tensor，也不对 `m_indptr` 做 per-row binary search。
+
+FlashInfer 参数说明称 padding columns 不参与计算，同时 Notes 要求 zero-fill。第一版
+按更严格的 zero-fill 约定实现：每次 GEMM 调用先清零整个目标 scale buffer，再写入
+当前有效位置。CUDA Graph capture 记录清零和 layout op，因此每次 replay 都重新
+执行；禁止只在 capture 前初始化一次。后续若要移除清零，必须作为独立性能优化，
+并用不同 `m_indptr` 连续 replay 的正确性测试证明不会消费 padding。
+
 必须满足：
 
 - 不使用 `.item()`、`.tolist()` 或 Python expert 循环；
 - 不发生 CPU/GPU 同步；
 - 支持空 expert 和极端 skew；
-- padding 区域写零；
-- GEMM1 和 GEMM2 共用实现；
+- 每次调用的 padding 区域写零；
+- GEMM1 和 GEMM2 只共用参数化底层实现，不混淆两种源行映射；
 - 同一份 scale 数值只搬运，不重新计算。
 
 ## 8. CUDA Graph 与显存生命周期
@@ -392,6 +451,10 @@ GEMM2 -> down_output
 为调用期临时 tensor、graph pool tensor，或由经验证可安全复用的共享 workspace
 管理。
 
+FlashInfer 要求 A-scale data pointer 16 字节对齐。独立 `torch.empty` 分配仍做
+运行时断言；若以后从共享 workspace 切片，切片起始字节偏移也必须保持 16 字节
+对齐，不能只检查 workspace 基地址。
+
 ### 8.4 Capture 条件
 
 - FlashInfer JIT 必须在 capture 前完成；
@@ -414,6 +477,7 @@ GEMM2 -> down_output
 | 量化 | blockwise FP8 |
 | block shape | `(128, 128)` |
 | activation input | BF16，动态 per-token-group 量化 |
+| routing ids | contiguous `int32`，不存在本阶段范围外的无效 routed row |
 | GEMM output | BF16 |
 | shape | GEMM 的 N/K 满足 128 对齐 |
 | MoE | gated SwiGLU，无 expert bias |
@@ -442,7 +506,10 @@ GEMM2 -> down_output
 ### 9.3 JIT
 
 不设置 `FLASHINFER_DISABLE_JIT=1`。服务器已有 NVCC 13.0，默认允许 runtime
-JIT。warm-up 阶段应先导入并执行 GEMM1/GEMM2，再进入 graph capture。
+JIT。目标 FP8 entry 与 MXFP8 entry 共用一个由 NVCC 构建、进程内缓存的 `.so`
+模块，不按 shape 分别编译；任一合法 eager 调用即可完成模块构建。warm-up 阶段
+仍分别执行一次 GEMM1/GEMM2，用于验证两套 shape、scale 和输出参数路径，然后
+再进入 graph capture，而不是为了触发两个 JIT module。
 
 如果用户禁用了 JIT 且缓存不存在，应保留原始 `MissingJITCacheError` 异常链，
 并提示移除该环境变量或安装/预构建匹配的 JIT cache。
@@ -484,8 +551,12 @@ backend 和 CUDA Graph 状态，不逐层或逐请求刷日志。
 - uniform、skew 和空 expert；
 - `T=1/8/128/8192`；
 - `m_indptr` 不变量；
+- 现有 permute kernel 对 FP8 payload 的编译可用性和 bitwise copy 正确性；
+- GEMM1 的 indirect gather scale 映射与 PyTorch reference 一致；
+- GEMM2 以 `dst` 选择 packed source row 的 scale 映射与 PyTorch reference 一致；
 - packed token/scale 与 PyTorch reference 一致；
-- padding 位置和零填充正确；
+- A-scale data pointer 和共享 workspace slice 的 16 字节对齐；
+- 每次调用的 padding 位置和零填充正确；
 - unpermute、top-k 加权和 routed scaling factor 正确。
 
 ### 10.3 完整 runner 数值测试
@@ -524,8 +595,9 @@ calc_diff < 1e-3
 2. capture 新 backend；
 3. replay 相同 shape、不同 hidden states；
 4. replay 相同 shape、不同 expert 分布；
-5. 每次与 eager reference 比较；
-6. 连续 replay，确认显存不持续增长。
+5. 连续 replay 时让同一 scale 列在“有效位置”和“padding”之间切换；
+6. 每次与 eager reference 比较，并确认 padding 没有旧数据污染；
+7. 连续 replay，确认显存不持续增长。
 
 硬性要求：capture 成功、replay 不触发 JIT、无非法显存访问、无旧输入污染，且
 改变输入后输出相应改变。
@@ -558,10 +630,18 @@ flashinfer_sm120_fp8
 ```
 
 主 benchmark 测完整 MoE runner。额外 component profile 分别记录 routing、quant、
-pack、GEMM1、SwiGLU+quant、GEMM2 和 unpermute/combine，用于定位非 GEMM 开销。
+FP8 gather、scale clear/layout、GEMM1、SwiGLU+quant、GEMM2 和
+unpermute/combine，用于定位非 GEMM 开销，尤其区分 scale padding 与固定 launch
+开销。
 为延续 Stage 1 的可比性，`M=65536` uniform profile 是固定的主判定 case；
 synthetic-skew 和真实模型路由回放（可获得时）必须同时记录，但不替代该固定
 判定输入。
+
+完整 benchmark 前先执行 CUTLASS runtime preflight。按当前 SGLang 判断逻辑，
+SM120 + CUDA 13.0 会通过 `cutlass_fp8_supported()`；preflight 仍需实际执行目标
+blockwise FP8 shape，以验证安装的 `sglang-kernel` wheel 和具体 kernel 路径。如果
+实际调用不可用，结果中记录 `CUTLASS_UNAVAILABLE` 和完整错误，不伪造成性能结果，
+也不阻塞 FlashInfer 的功能正确性验证。
 
 ### 11.2 频率与复现
 
@@ -581,6 +661,11 @@ Stage 1 的采样和稳定性检查；测试结束后恢复默认频率。
 功能和 CUDA Graph 正确，但 quant/pack/combine 开销吞掉主要 kernel 收益。保留为
 显式实验 backend，不推荐生产启用，并继续优化数据搬运。
 
+第一阶段 backend 始终是纯 FlashInfer GEMM1+GEMM2 单路径，不按 batch、token 数
+或 `M` 自动切换 Triton。若 decode 稳定回退超过 GO 门槛，先归类为
+`FUNCTIONAL_ONLY`；只有取得完整 runner 实测证据后，才另行设计显式配置、启动
+日志可见且 CUDA Graph 行为明确的 hybrid 策略。该策略不属于本设计的初始实现。
+
 #### NO_GO
 
 数值正确性、CUDA Graph 或真实服务稳定性失败，不进入部署。
@@ -592,15 +677,16 @@ CUTLASS 是必须记录的对照而不是新 backend 的硬性胜负门槛。如
 
 书面设计获批后，先生成独立实施计划，再开始代码修改。实施遵循：
 
-1. 先写能力检查、layout/reference 和 runner 测试；
-2. 再注册 backend 和 quant info；
-3. 实现 packing/scale layout；
-4. 接入两次 FlashInfer GEMM；
-5. 完成 eager correctness；
-6. 完成 CUDA Graph；
-7. 在服务器运行完整 runner 和模型实验；
-8. 最终锁频对照 Triton、CUTLASS 和新 backend；
-9. 提交前进行代码审查和完整验证。
+1. 先写能力检查、FP8 gather bitwise、layout/reference 和 runner 失败测试；
+2. 在 SM120 上验证现有 permute kernel 的 FP8 copy；失败时才实现专用 FP8 gather；
+3. 再注册 backend 和 quant info；
+4. 实现 FP8 packing 和两种 source-row mode 的 scale layout；
+5. 接入两次 FlashInfer GEMM；
+6. 完成 eager correctness；
+7. 完成包含动态 `m_indptr` 和 padding 重写的 CUDA Graph 测试；
+8. 在服务器运行 CUTLASS preflight、完整 runner 和模型实验；
+9. 最终锁频对照 Triton、可用时的 CUTLASS 和新 backend；
+10. 提交前进行代码审查和完整验证。
 
 代码修改开始前必须再次取得用户批准。服务器无法由开发端 SSH 登录，所有服务
 器命令由用户执行；虚拟环境中的包管理命令必须使用 `uv pip --python ...`。
