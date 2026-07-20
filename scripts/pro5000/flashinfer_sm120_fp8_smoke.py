@@ -26,6 +26,17 @@ def build_offsets(rows_per_expert: list[int]) -> list[int]:
     return offsets
 
 
+def build_scale_copy_plan(offsets: list[int]) -> list[tuple[int, int, int]]:
+    if not offsets or offsets[0] != 0:
+        raise ValueError("offsets must start at zero")
+    if any(end < start for start, end in zip(offsets, offsets[1:])):
+        raise ValueError("offsets must be non-decreasing")
+    return [
+        (start, end, compute_padded_offset(start, expert_id))
+        for expert_id, (start, end) in enumerate(zip(offsets, offsets[1:]))
+    ]
+
+
 def calc_diff(x, y) -> float:
     x = x.double()
     y = y.double()
@@ -46,12 +57,9 @@ def quantize_and_pack_a(x, m_indptr):
     packed = torch.zeros(
         (k_blocks, m_padded), dtype=torch.float32, device=x.device
     )
-    for expert_id in range(num_experts):
-        start = int(m_indptr[expert_id].item())
-        end = int(m_indptr[expert_id + 1].item())
+    for start, end, packed_start in build_scale_copy_plan(m_indptr.tolist()):
         if start == end:
             continue
-        packed_start = compute_padded_offset(start, expert_id)
         packed[:, packed_start : packed_start + end - start] = (
             scale_row_major[start:end].t()
         )
