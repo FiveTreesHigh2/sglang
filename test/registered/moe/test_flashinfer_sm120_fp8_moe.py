@@ -123,6 +123,83 @@ def _calc_diff(actual, expected):
     return float((numerator / denominator).item())
 
 
+def _grouped_fp32_reference(a, b, a_scale, b_scale, m_indptr):
+    boundaries = m_indptr.cpu().tolist()
+    num_experts = len(boundaries) - 1
+    a_scale_rows = torch.empty(
+        (a.shape[0], a_scale.shape[0]),
+        device=a.device,
+        dtype=torch.float32,
+    )
+    for expert, (start, end) in enumerate(
+        zip(boundaries, boundaries[1:])
+    ):
+        aligned_start = ((start + 3 * expert) // 4) * 4
+        a_scale_rows[start:end] = a_scale[
+            :, aligned_start : aligned_start + end - start
+        ].T
+
+    a_dequant = a.float() * a_scale_rows.repeat_interleave(128, dim=1)
+    reference = torch.empty(
+        (a.shape[0], b.shape[1]),
+        device=a.device,
+        dtype=torch.float32,
+    )
+    previous_allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        for expert in range(num_experts):
+            start, end = boundaries[expert : expert + 2]
+            if start == end:
+                continue
+            scale = b_scale[expert].T
+            b_dequant = b[expert].float() * scale.repeat_interleave(
+                128, dim=0
+            ).repeat_interleave(128, dim=1)
+            reference[start:end] = a_dequant[start:end] @ b_dequant.T
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_allow_tf32
+    return reference
+
+
+def _run_flashinfer_with_stage_diagnostics(dispatch, config, quant_info):
+    from sglang.srt.layers.moe.moe_runner import (
+        flashinfer_sm120_fp8 as flashinfer_runner,
+    )
+
+    diagnostics = []
+    original_grouped_gemm = flashinfer_runner._run_grouped_gemm
+
+    def recording_grouped_gemm(a, b, a_scale, b_scale, m_indptr, out):
+        original_grouped_gemm(a, b, a_scale, b_scale, m_indptr, out)
+        reference = _grouped_fp32_reference(
+            a,
+            b,
+            a_scale,
+            b_scale,
+            m_indptr,
+        )
+        diagnostics.append(
+            {
+                "diff": _calc_diff(out, reference),
+                "actual_abs_mean": float(out.float().abs().mean().item()),
+                "reference_abs_mean": float(reference.abs().mean().item()),
+            }
+        )
+
+    with patch.object(
+        flashinfer_runner,
+        "_run_grouped_gemm",
+        recording_grouped_gemm,
+    ):
+        output = flashinfer_runner.fused_experts_none_to_flashinfer_sm120_fp8(
+            dispatch,
+            quant_info,
+            config,
+        ).hidden_states
+    return output, diagnostics
+
+
 def _run_triton_reference(
     dispatch,
     config,
@@ -338,10 +415,6 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
         torch.testing.assert_close(out, expected)
 
     def test_full_runner_correctness(self):
-        from sglang.srt.layers.moe.moe_runner.flashinfer_sm120_fp8 import (
-            fused_experts_none_to_flashinfer_sm120_fp8,
-        )
-
         cases = [
             (1, 1, torch.tensor([[0]], device="cuda", dtype=torch.int32)),
             (
@@ -383,11 +456,13 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
                 dispatch, config, quant_info, w13_scale, w2_scale = (
                     _make_runner_case(tokens, top_k, topk_ids)
                 )
-                actual = fused_experts_none_to_flashinfer_sm120_fp8(
-                    dispatch,
-                    quant_info,
-                    config,
-                ).hidden_states
+                actual, stage_diagnostics = (
+                    _run_flashinfer_with_stage_diagnostics(
+                        dispatch,
+                        config,
+                        quant_info,
+                    )
+                )
                 expected = _run_triton_reference(
                     dispatch,
                     config,
@@ -395,5 +470,19 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
                     w13_scale,
                     w2_scale,
                 )
+                full_diff = _calc_diff(actual, expected)
+                print(
+                    "[diagnostic] "
+                    f"tokens={tokens} top_k={top_k} "
+                    f"gemm1_direct={stage_diagnostics[0]} "
+                    f"gemm2_direct={stage_diagnostics[1]} "
+                    f"full_vs_triton={full_diff:.6e} "
+                    f"actual_abs_mean={actual.float().abs().mean().item():.6e} "
+                    f"triton_abs_mean={expected.float().abs().mean().item():.6e}"
+                )
                 self.assertTrue(bool(torch.isfinite(actual).all()))
-                self.assertLess(_calc_diff(actual, expected), 1e-3)
+                self.assertLess(
+                    full_diff,
+                    1e-3,
+                    msg=f"tokens={tokens} top_k={top_k}",
+                )
