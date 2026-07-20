@@ -29,8 +29,16 @@ def load_script(filename: str):
     spec = importlib.util.spec_from_file_location(path.stem, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    with pro5000_scripts_on_path():
-        spec.loader.exec_module(module)
+    previous = sys.modules.get(path.stem)
+    sys.modules[path.stem] = module
+    try:
+        with pro5000_scripts_on_path():
+            spec.loader.exec_module(module)
+    finally:
+        if previous is None:
+            sys.modules.pop(path.stem, None)
+        else:
+            sys.modules[path.stem] = previous
     return module
 
 
@@ -201,6 +209,25 @@ class TestPro5000Stage1(unittest.TestCase):
             self.assertRaises(SystemExit),
         ):
             bench.parse_args()
+
+    def test_benchmark_uses_low_level_kernels_without_quant_wrapper(self) -> None:
+        source = (
+            PRO5000_SCRIPTS / "benchmark_flashinfer_sm120_fp8_moe.py"
+        ).read_text()
+        self.assertIn("moe_gemm_fp8_nt_groupwise(", source)
+        self.assertIn("fused_moe_kernel[grid](", source)
+        self.assertNotIn("invoke_fused_moe_kernel(", source)
+        self.assertIn("out=case.flashinfer_output", source)
+        self.assertNotIn("FLASHINFER_DISABLE_JIT=1", source)
+
+    def test_benchmark_records_both_scale_layouts(self) -> None:
+        source = (
+            PRO5000_SCRIPTS / "benchmark_flashinfer_sm120_fp8_moe.py"
+        ).read_text()
+        self.assertIn("a_scale_row_major", source)
+        self.assertIn("a_scale_flashinfer", source)
+        self.assertIn("b_scale_triton", source)
+        self.assertIn("b_scale_flashinfer", source)
 
 
 if __name__ == "__main__":
