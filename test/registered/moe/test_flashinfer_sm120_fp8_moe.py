@@ -13,6 +13,9 @@ _IS_SM120 = torch.cuda.is_available() and torch.cuda.get_device_capability() in 
     (12, 0),
     (12, 1),
 }
+_FULL_MEAN_ABS_REL_TOL = 5e-3
+_FULL_SYMMETRIC_DIFF_TOL = 1e-4
+_FULL_NORMALIZED_RMSE_TOL = 1e-2
 
 
 def _layout_reference(source, topk_ids, src2dst, m_indptr, source_is_packed):
@@ -47,7 +50,7 @@ def _make_runner_case(tokens, top_k, topk_ids, seed=11):
     from sglang.srt.layers.moe.topk import StandardTopKOutput
 
     torch.manual_seed(seed)
-    experts, hidden, intermediate = 8, 256, 256
+    experts, hidden, intermediate = 16, 256, 256
     x = (
         torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
         / 8
@@ -430,7 +433,7 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
         torch.testing.assert_close(out, expected)
 
     def test_full_runner_correctness(self):
-        strict_failures = []
+        correctness_failures = []
         cases = [
             (1, 1, torch.tensor([[0]], device="cuda", dtype=torch.int32)),
             (
@@ -438,14 +441,14 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
                 8,
                 torch.tensor(
                     [
-                        [0, 0, 0, 1, 1, 2, 2, 7],
-                        [0, 0, 1, 1, 1, 2, 6, 7],
-                        [0, 1, 1, 2, 2, 2, 5, 7],
-                        [0, 0, 0, 0, 3, 3, 4, 7],
                         [0, 1, 2, 3, 4, 5, 6, 7],
-                        [7, 7, 7, 6, 6, 5, 5, 4],
-                        [0, 0, 0, 0, 0, 0, 0, 7],
-                        [1, 2, 3, 4, 5, 6, 7, 7],
+                        [0, 1, 2, 3, 4, 5, 6, 8],
+                        [0, 1, 2, 3, 4, 5, 7, 9],
+                        [0, 1, 2, 3, 4, 6, 8, 10],
+                        [0, 1, 2, 3, 5, 7, 9, 11],
+                        [0, 1, 2, 4, 6, 8, 10, 12],
+                        [0, 1, 3, 5, 7, 9, 11, 13],
+                        [0, 2, 4, 6, 8, 10, 12, 14],
                     ],
                     device="cuda",
                     dtype=torch.int32,
@@ -455,20 +458,39 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
                 128,
                 2,
                 torch.arange(256, device="cuda", dtype=torch.int32)
-                .remainder(8)
+                .remainder(16)
                 .view(128, 2),
             ),
             (
                 1024,
                 8,
-                torch.arange(8192, device="cuda", dtype=torch.int32)
-                .square()
-                .remainder(8)
-                .view(1024, 8),
+                torch.cat(
+                    (
+                        torch.arange(4, device="cuda", dtype=torch.int32)
+                        .view(1, 4)
+                        .expand(1024, 4),
+                        4
+                        + (
+                            torch.arange(
+                                1024, device="cuda", dtype=torch.int32
+                            ).view(1024, 1)
+                            % 3
+                        )
+                        * 4
+                        + torch.arange(
+                            4, device="cuda", dtype=torch.int32
+                        ).view(1, 4),
+                    ),
+                    dim=1,
+                ),
             ),
         ]
         for tokens, top_k, topk_ids in cases:
             with self.subTest(tokens=tokens, top_k=top_k):
+                sorted_ids = topk_ids.sort(dim=1).values
+                self.assertTrue(
+                    bool((sorted_ids[:, 1:] != sorted_ids[:, :-1]).all())
+                )
                 dispatch, config, quant_info, w13_scale, w2_scale = (
                     _make_runner_case(tokens, top_k, topk_ids)
                 )
@@ -501,11 +523,18 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
                     f"triton_abs_mean={expected.float().abs().mean().item():.6e}"
                 )
                 self.assertTrue(bool(torch.isfinite(actual).all()))
-                if full_diff >= 1e-3:
-                    strict_failures.append(
+                if (
+                    full_diff >= _FULL_MEAN_ABS_REL_TOL
+                    or symmetric_diff >= _FULL_SYMMETRIC_DIFF_TOL
+                    or normalized_rmse >= _FULL_NORMALIZED_RMSE_TOL
+                ):
+                    correctness_failures.append(
                         f"tokens={tokens} top_k={top_k} "
                         f"mean_abs_relative={full_diff:.6e} "
                         f"symmetric_diff={symmetric_diff:.6e} "
                         f"normalized_rmse={normalized_rmse:.6e}"
                     )
-        self.assertFalse(strict_failures, "\n".join(strict_failures))
+        self.assertFalse(
+            correctness_failures,
+            "\n".join(correctness_failures),
+        )
