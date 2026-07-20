@@ -1019,6 +1019,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
         self.with_bias = False
+        if get_moe_runner_backend().is_flashinfer_sm120_fp8():
+            if (
+                not self.block_quant
+                or tuple(self.weight_block_size or ()) != (128, 128)
+            ):
+                raise ValueError(
+                    "flashinfer_sm120_fp8 block_shape must be (128, 128)"
+                )
+            if self.use_mxfp8:
+                raise ValueError("flashinfer_sm120_fp8 does not support MXFP8")
+            if self.is_fp4_expert:
+                raise ValueError(
+                    "flashinfer_sm120_fp8 does not support FP4 experts"
+                )
         if get_moe_runner_backend().is_cutlass():
             assert (
                 cutlass_fp8_supported()
@@ -2018,6 +2032,26 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
 
+        if get_moe_runner_backend().is_flashinfer_sm120_fp8():
+            from sglang.srt.layers.moe.moe_runner.flashinfer_sm120_fp8 import (
+                prepare_flashinfer_sm120_fp8_weight_scales,
+            )
+
+            w13_scale_fi, w2_scale_fi = (
+                prepare_flashinfer_sm120_fp8_weight_scales(
+                    layer.w13_weight_scale_inv.data,
+                    layer.w2_weight_scale_inv.data,
+                )
+            )
+            layer.register_parameter(
+                "w13_weight_scale_fi",
+                torch.nn.Parameter(w13_scale_fi, requires_grad=False),
+            )
+            layer.register_parameter(
+                "w2_weight_scale_fi",
+                torch.nn.Parameter(w2_scale_fi, requires_grad=False),
+            )
+
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
 
@@ -2112,12 +2146,46 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
 
+        if moe_runner_backend.is_flashinfer_sm120_fp8():
+            if self.with_bias:
+                raise ValueError(
+                    "flashinfer_sm120_fp8 does not support expert bias"
+                )
+            if (
+                moe_runner_config.activation != "silu"
+                or not moe_runner_config.is_gated
+            ):
+                raise ValueError(
+                    "flashinfer_sm120_fp8 supports gated SiLU/SwiGLU only"
+                )
+            if moe_runner_config.apply_router_weight_on_input:
+                raise ValueError(
+                    "flashinfer_sm120_fp8 does not support "
+                    "apply_router_weight_on_input"
+                )
+            if moe_runner_config.no_combine:
+                raise ValueError(
+                    "flashinfer_sm120_fp8 does not support no_combine"
+                )
+            if (
+                moe_runner_config.gemm1_alpha is not None
+                or moe_runner_config.gemm1_clamp_limit is not None
+            ):
+                raise ValueError(
+                    "flashinfer_sm120_fp8 does not support GPT-OSS alpha/limit"
+                )
+            if moe_runner_config.swiglu_limit is not None:
+                raise ValueError(
+                    "flashinfer_sm120_fp8 does not support swiglu_limit"
+                )
+
         if (
             moe_runner_backend.is_deep_gemm()
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_aiter()
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
+            or moe_runner_backend.is_flashinfer_sm120_fp8()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
@@ -2273,7 +2341,30 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             return StandardCombineInput(hidden_states=output)
 
-        if self.runner.runner_backend.is_deep_gemm():
+        if self.runner.runner_backend.is_flashinfer_sm120_fp8():
+            if self.with_bias:
+                raise ValueError(
+                    "flashinfer_sm120_fp8 does not support expert bias"
+                )
+            from sglang.srt.layers.moe.moe_runner.flashinfer_sm120_fp8 import (
+                FlashInferSm120Fp8MoeQuantInfo,
+            )
+
+            if not hasattr(layer, "w13_weight_scale_fi") or not hasattr(
+                layer, "w2_weight_scale_fi"
+            ):
+                raise RuntimeError(
+                    "flashinfer_sm120_fp8 weight scales were not prepared "
+                    "after checkpoint loading"
+                )
+            quant_info = FlashInferSm120Fp8MoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_weight_scale_fi=layer.w13_weight_scale_fi,
+                w2_weight_scale_fi=layer.w2_weight_scale_fi,
+                block_shape=tuple(self.weight_block_size),
+            )
+        elif self.runner.runner_backend.is_deep_gemm():
 
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
