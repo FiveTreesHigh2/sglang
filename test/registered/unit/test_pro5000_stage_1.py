@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -251,6 +253,25 @@ class TestPro5000Stage1(unittest.TestCase):
                 "status",
             },
         )
+
+    def test_stage_1_wrapper_is_safe_and_uses_existing_venv(self) -> None:
+        script = PRO5000_SCRIPTS / "run_stage_1_benchmark.sh"
+        completed = subprocess.run(
+            ["bash", "-n", str(script)], text=True, capture_output=True
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        content = script.read_text()
+        self.assertIn('${PRO5000_ROOT}/.venv/bin/python3', content)
+        self.assertIn('uv pip check --python "${PYTHON}"', content)
+        self.assertIn('uv pip freeze --python "${PYTHON}"', content)
+        self.assertIn("benchmark_flashinfer_sm120_fp8_moe.py", content)
+        self.assertIn("FLASHINFER_WORKSPACE_BASE", content)
+        self.assertNotIn("FLASHINFER_DISABLE_JIT=1", content)
+        self.assertNotIn("nvidia-smi -lgc", content)
+        self.assertNotIn("nvidia-smi -rgc", content)
+        self.assertIsNone(re.search(r"(?m)^\s*pip\s", content))
+        self.assertIsNone(re.search(r"python3?\s+-m\s+pip", content))
+        self.assertNotIn("rm -rf", content)
 
 
 if __name__ == "__main__":
