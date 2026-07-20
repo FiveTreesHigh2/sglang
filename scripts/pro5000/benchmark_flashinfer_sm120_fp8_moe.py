@@ -36,6 +36,7 @@ OP_SHAPES = {
     "gemm1": {"n": 1024, "k": 2048, "historical_ms": 1.267},
     "gemm2": {"n": 2048, "k": 512, "historical_ms": 0.794},
 }
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass
@@ -72,7 +73,10 @@ def validate_rows_per_expert(
         raise ValueError(
             f"expected {num_experts} rows_per_expert values, got {len(normalized)}"
         )
-    if any(isinstance(value, bool) or not isinstance(value, int) for value in normalized):
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in normalized
+    ):
         raise ValueError("rows_per_expert values must be integers")
     if any(value < 0 for value in normalized):
         raise ValueError("rows_per_expert values must be non-negative")
@@ -209,10 +213,16 @@ def decide_locked(
     speedup: float,
     triton_relative_spread: float,
     flashinfer_relative_spread: float,
+    environment_stable: bool,
     correctness_passed: bool,
 ) -> dict[str, Any]:
     if not correctness_passed:
         return {"status": "ERROR", "reasons": ["correctness failed"]}
+    if not environment_stable:
+        return {
+            "status": "NEEDS_LOCKED_RERUN",
+            "reasons": ["locked GPU environment evidence was not stable"],
+        }
     if max(triton_relative_spread, flashinfer_relative_spread) > 0.05:
         return {
             "status": "NEEDS_LOCKED_RERUN",
@@ -614,6 +624,7 @@ def _package_versions() -> dict[str, str | None]:
         "sglang",
         "sglang-kernel",
         "flashinfer-python",
+        "flashinfer-jit-cache",
         "nvidia-cutlass-dsl",
     ):
         try:
@@ -638,6 +649,8 @@ def empty_result_payload(command: Sequence[str]) -> dict[str, Any]:
 
 
 def collect_environment() -> dict[str, Any]:
+    import flashinfer
+    import sglang
     import torch
     from flashinfer.grouped_mm import moe_gemm_fp8_nt_groupwise
 
@@ -647,7 +660,9 @@ def collect_environment() -> dict[str, Any]:
         "platform": platform.platform(),
         "python_executable": sys.executable,
         "python_version": sys.version,
+        "python_version_info": list(sys.version_info[:3]),
         "packages": _package_versions(),
+        "torch_version": torch.__version__,
         "torch_cuda": torch.version.cuda,
         "cuda_available": cuda_available,
         "gpu": torch.cuda.get_device_name() if cuda_available else None,
@@ -656,11 +671,121 @@ def collect_environment() -> dict[str, Any]:
         ),
         "flashinfer_workspace_base": os.environ.get("FLASHINFER_WORKSPACE_BASE"),
         "flashinfer_disable_jit": os.environ.get("FLASHINFER_DISABLE_JIT"),
+        "flashinfer_file": str(Path(flashinfer.__file__).resolve()),
+        "sglang_file": str(Path(sglang.__file__).resolve()),
+        "nvcc": _run_command(["nvcc", "--version"]),
     }
 
 
-def sample_gpu_state() -> dict[str, Any]:
+def validate_environment_contract(
+    environment: dict[str, Any], *, expected_repo: Path = REPO_ROOT
+) -> None:
+    errors: list[str] = []
+    version_info = environment.get("python_version_info") or []
+    if list(version_info[:2]) != [3, 12]:
+        errors.append(f"Python must be 3.12, got {version_info}")
+
+    torch_version = str(environment.get("torch_version") or "")
+    if torch_version.split("+", 1)[0] != "2.11.0":
+        errors.append(f"torch must be 2.11.0, got {torch_version or None}")
+    if environment.get("torch_cuda") != "13.0":
+        errors.append(
+            f"torch CUDA runtime must be 13.0, got {environment.get('torch_cuda')}"
+        )
+
+    packages = environment.get("packages") or {}
+    required_packages = {
+        "flashinfer-python": "0.6.15.dev20260716",
+        "nvidia-cutlass-dsl": "4.5.2",
+        "sglang-kernel": "0.4.4",
+    }
+    for package, expected_version in required_packages.items():
+        actual_version = packages.get(package)
+        if actual_version != expected_version:
+            errors.append(
+                f"{package} must be {expected_version}, got {actual_version}"
+            )
+    if packages.get("flashinfer-jit-cache") is not None:
+        errors.append(
+            "flashinfer-jit-cache must be absent for the runtime-JIT Stage 1 run"
+        )
+
+    gpu_name = str(environment.get("gpu") or "")
+    if "RTX PRO 5000" not in gpu_name:
+        errors.append(f"GPU must be RTX PRO 5000, got {gpu_name or None}")
+    if tuple(environment.get("compute_capability") or ()) not in {
+        (12, 0),
+        (12, 1),
+    }:
+        errors.append(
+            "compute capability must be 12.0 or 12.1, got "
+            f"{environment.get('compute_capability')}"
+        )
+
+    nvcc = environment.get("nvcc") or {}
+    nvcc_output = f"{nvcc.get('stdout', '')}\n{nvcc.get('stderr', '')}"
+    if nvcc.get("returncode") != 0:
+        errors.append("nvcc --version did not complete successfully")
+    elif "release 13.0" not in nvcc_output or "V13.0.48" not in nvcc_output:
+        errors.append("NVCC must report CUDA 13.0 V13.0.48")
+
+    sglang_file = environment.get("sglang_file")
+    expected_sglang_root = (expected_repo / "python" / "sglang").resolve()
+    try:
+        Path(str(sglang_file)).resolve().relative_to(expected_sglang_root)
+    except (TypeError, ValueError):
+        errors.append(
+            "sglang must import from the current checkout at "
+            f"{expected_sglang_root}, got {sglang_file}"
+        )
+
+    if errors:
+        raise RuntimeError("Stage 1 environment contract failed: " + "; ".join(errors))
+
+
+def resolve_nvidia_smi_gpu_id(*, pid: int | None = None) -> str:
+    target_pid = os.getpid() if pid is None else pid
+    completed = _run_command(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=pid,gpu_uuid",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+    if completed.get("returncode") != 0:
+        raise RuntimeError(
+            "failed to map the CUDA process to an nvidia-smi GPU: "
+            f"{completed.get('stderr') or completed}"
+        )
+    matches: set[str] = set()
+    for line in completed.get("stdout", "").splitlines():
+        values = [value.strip() for value in line.split(",")]
+        if len(values) != 2:
+            continue
+        try:
+            row_pid = int(values[0])
+        except ValueError:
+            continue
+        if row_pid == target_pid and values[1]:
+            matches.add(values[1])
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"expected one nvidia-smi GPU UUID for pid {target_pid}, "
+            f"found {sorted(matches)}"
+        )
+    return next(iter(matches))
+
+
+def sample_gpu_state(
+    gpu_id: str | None, *, identity_error: str | None = None
+) -> dict[str, Any]:
+    if gpu_id is None:
+        return {
+            "ok": False,
+            "identity_error": identity_error or "nvidia-smi GPU identity unresolved",
+        }
     fields = (
+        "uuid",
         "index",
         "pstate",
         "clocks.current.sm",
@@ -673,7 +798,7 @@ def sample_gpu_state() -> dict[str, Any]:
         "nvidia-smi",
         f"--query-gpu={','.join(fields)}",
         "--format=csv,noheader,nounits",
-        "--id=0",
+        f"--id={gpu_id}",
     ]
     completed = _run_command(command)
     if completed.get("returncode") != 0:
@@ -701,22 +826,28 @@ def sample_gpu_state() -> dict[str, Any]:
 
     return {
         "ok": True,
-        "index": values[0],
-        "pstate": values[1],
-        "sm_clock_mhz": parse_number(values[2]),
-        "temperature_c": parse_number(values[3]),
-        "power_draw_w": parse_number(values[4]),
-        "utilization_percent": parse_number(values[5]),
-        "memory_used_mib": parse_number(values[6]),
+        "gpu_uuid": values[0],
+        "expected_gpu_uuid": gpu_id,
+        "identity_matches": values[0] == gpu_id,
+        "index": values[1],
+        "pstate": values[2],
+        "sm_clock_mhz": parse_number(values[3]),
+        "temperature_c": parse_number(values[4]),
+        "power_draw_w": parse_number(values[5]),
+        "utilization_percent": parse_number(values[6]),
+        "memory_used_mib": parse_number(values[7]),
         "raw": lines[0],
     }
 
 
 def evaluate_gpu_stability(samples: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    if not samples or any(not sample.get("ok") for sample in samples):
+    if not samples or any(
+        not sample.get("ok") or not sample.get("identity_matches")
+        for sample in samples
+    ):
         return {
             "stable": False,
-            "reasons": ["one or more nvidia-smi samples failed"],
+            "reasons": ["one or more nvidia-smi samples failed identity validation"],
             "sm_clock_relative_spread": None,
         }
     pstates = {sample.get("pstate") for sample in samples}
@@ -747,6 +878,16 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     temporary = path.with_name(f".{path.name}.tmp")
     temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     temporary.replace(path)
+
+
+def emit_stdout_json_if_needed(
+    payload: dict[str, Any], output_path: Path | None
+) -> None:
+    if output_path is not None:
+        return
+    print("STAGE_1_JSON_BEGIN", flush=True)
+    print(json.dumps(payload, indent=2, sort_keys=True), flush=True)
+    print("STAGE_1_JSON_END", flush=True)
 
 
 def prepare_backend(fn: Callable[[], None]) -> float:
@@ -807,6 +948,14 @@ def run_benchmark_case(
         flush=True,
     )
     case = make_quantized_case(operation, profile, rows, seed=seed)
+    gpu_identity_error = None
+    try:
+        nvidia_smi_gpu_id = resolve_nvidia_smi_gpu_id()
+        print(f"[gpu] nvidia_smi_id={nvidia_smi_gpu_id}", flush=True)
+    except RuntimeError as error:
+        nvidia_smi_gpu_id = None
+        gpu_identity_error = str(error)
+        print(f"[gpu] identity unresolved: {gpu_identity_error}", flush=True)
     functions = {
         "triton": lambda: launch_triton(case),
         "flashinfer": lambda: launch_flashinfer(case),
@@ -833,9 +982,13 @@ def run_benchmark_case(
     gpu_samples: list[dict[str, Any]] = []
     for trial_index in range(args.trials):
         for backend in trial_backend_order(trial_index):
-            before = sample_gpu_state()
+            before = sample_gpu_state(
+                nvidia_smi_gpu_id, identity_error=gpu_identity_error
+            )
             latency_ms = time_backend(functions[backend], args.iterations)
-            after = sample_gpu_state()
+            after = sample_gpu_state(
+                nvidia_smi_gpu_id, identity_error=gpu_identity_error
+            )
             latencies[backend].append(latency_ms)
             gpu_samples.extend(
                 [
@@ -901,6 +1054,8 @@ def run_benchmark_case(
         "historical_reference_ms": OP_SHAPES[operation]["historical_ms"],
         "gpu_samples": gpu_samples,
         "gpu_stability": stability,
+        "nvidia_smi_gpu_id": nvidia_smi_gpu_id,
+        "gpu_identity_error": gpu_identity_error,
     }
     del case, functions
     torch.cuda.empty_cache()
@@ -951,6 +1106,7 @@ def _select_decision(
             "relative_spread"
         ],
         "correctness_passed": target["correctness"]["passed"],
+        "environment_stable": target["gpu_stability"]["stable"],
     }
     if clock_mode == "locked":
         decision = decide_locked(**common)
@@ -958,7 +1114,6 @@ def _select_decision(
         decision = decide_default_boost(
             **common,
             min_trial_speedup=target["min_trial_speedup"],
-            environment_stable=target["gpu_stability"]["stable"],
         )
     return {
         **decision,
@@ -1013,7 +1168,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if args.rows_per_expert_json is not None:
         if len(args.cum_m) != 1:
             parser.error("--rows-per-expert-json requires exactly one --cum-m")
-        if "--profiles" in raw_argv:
+        if any(
+            value == "--profiles" or value.startswith("--profiles=")
+            for value in raw_argv
+        ):
             parser.error("--rows-per-expert-json cannot be combined with --profiles")
     for name in ("warmup", "iterations", "trials"):
         if getattr(args, name) <= 0:
@@ -1056,6 +1214,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "FLASHINFER_DISABLE_JIT must be unset for the Stage 1 benchmark"
             )
         payload["environment"] = collect_environment()
+        validate_environment_contract(payload["environment"])
         if not payload["environment"]["cuda_available"]:
             raise RuntimeError("CUDA is not available")
         if tuple(payload["environment"]["compute_capability"]) not in {
@@ -1096,6 +1255,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         payload["status"] = "completed"
         persist()
+        emit_stdout_json_if_needed(payload, args.output)
         print(f"STAGE_1_DECISION={payload['decision']['status']}", flush=True)
         print(
             "STAGE_1_RESULT_JSON="
@@ -1125,6 +1285,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 flush=True,
             )
         traceback.print_exc()
+        emit_stdout_json_if_needed(payload, args.output)
         print("STAGE_1_DECISION=ERROR", flush=True)
         print(
             "STAGE_1_RESULT_JSON="

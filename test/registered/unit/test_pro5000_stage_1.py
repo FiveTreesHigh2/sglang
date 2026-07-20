@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import contextmanager, redirect_stderr
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -171,6 +171,7 @@ class TestPro5000Stage1(unittest.TestCase):
                     speedup=speedup,
                     triton_relative_spread=0.05,
                     flashinfer_relative_spread=0.05,
+                    environment_stable=True,
                     correctness_passed=True,
                 )
                 self.assertEqual(decision["status"], expected)
@@ -178,9 +179,87 @@ class TestPro5000Stage1(unittest.TestCase):
             speedup=0.30,
             triton_relative_spread=0.051,
             flashinfer_relative_spread=0.01,
+            environment_stable=True,
             correctness_passed=True,
         )
         self.assertEqual(unstable["status"], "NEEDS_LOCKED_RERUN")
+
+    def test_locked_decision_rejects_missing_gpu_evidence(self) -> None:
+        bench = load_script("benchmark_flashinfer_sm120_fp8_moe.py")
+        target = {
+            "operation": "gemm1",
+            "profile": "uniform",
+            "cum_m": 65536,
+            "speedup": 0.40,
+            "min_trial_speedup": 0.40,
+            "correctness": {"passed": True},
+            "latency": {
+                "triton": {"relative_spread": 0.01},
+                "flashinfer": {"relative_spread": 0.01},
+            },
+            "gpu_stability": {"stable": False},
+        }
+        decision = bench._select_decision([target], "locked")
+        self.assertEqual(decision["status"], "NEEDS_LOCKED_RERUN")
+
+    def test_nvidia_smi_gpu_id_is_resolved_from_current_process(self) -> None:
+        bench = load_script("benchmark_flashinfer_sm120_fp8_moe.py")
+        response = {
+            "returncode": 0,
+            "stdout": "999, GPU-other\n1234, GPU-current\n",
+            "stderr": "",
+        }
+        with mock.patch.object(bench, "_run_command", return_value=response):
+            self.assertEqual(
+                bench.resolve_nvidia_smi_gpu_id(pid=1234), "GPU-current"
+            )
+
+    def test_unresolved_gpu_identity_does_not_guess(self) -> None:
+        bench = load_script("benchmark_flashinfer_sm120_fp8_moe.py")
+        with mock.patch.object(bench, "_run_command") as run_command:
+            sample = bench.sample_gpu_state(
+                None, identity_error="no GPU UUID for current process"
+            )
+        self.assertFalse(sample["ok"])
+        self.assertIn("no GPU UUID", sample["identity_error"])
+        run_command.assert_not_called()
+
+    def test_environment_contract_rejects_version_or_checkout_drift(self) -> None:
+        bench = load_script("benchmark_flashinfer_sm120_fp8_moe.py")
+        environment = {
+            "python_version_info": [3, 12, 3],
+            "torch_version": "2.11.0",
+            "torch_cuda": "13.0",
+            "gpu": "NVIDIA RTX PRO 5000 72GB Blackwell",
+            "compute_capability": [12, 0],
+            "packages": {
+                "flashinfer-python": "0.6.15.dev20260716",
+                "flashinfer-jit-cache": None,
+                "nvidia-cutlass-dsl": "4.5.2",
+                "sglang-kernel": "0.4.4",
+            },
+            "nvcc": {
+                "returncode": 0,
+                "stdout": "Cuda compilation tools, release 13.0, V13.0.48",
+            },
+            "sglang_file": "/repo/python/sglang/__init__.py",
+        }
+        bench.validate_environment_contract(
+            environment, expected_repo=Path("/repo")
+        )
+
+        environment["packages"]["flashinfer-jit-cache"] = "0.6.15"
+        with self.assertRaisesRegex(RuntimeError, "flashinfer-jit-cache"):
+            bench.validate_environment_contract(
+                environment, expected_repo=Path("/repo")
+            )
+
+        environment["packages"]["flashinfer-jit-cache"] = None
+        environment["sglang_file"] = "/somewhere/site-packages/sglang/__init__.py"
+        with self.assertRaisesRegex(RuntimeError, "checkout"):
+            bench.validate_environment_contract(
+                environment, expected_repo=Path("/repo")
+            )
 
     def test_cli_defaults_match_approved_design(self) -> None:
         bench = load_script("benchmark_flashinfer_sm120_fp8_moe.py")
@@ -196,21 +275,56 @@ class TestPro5000Stage1(unittest.TestCase):
 
     def test_cli_rejects_json_and_generated_profiles_from_sys_argv(self) -> None:
         bench = load_script("benchmark_flashinfer_sm120_fp8_moe.py")
-        argv = [
-            "benchmark_flashinfer_sm120_fp8_moe.py",
-            "--rows-per-expert-json",
-            "rows.json",
-            "--cum-m",
-            "256",
-            "--profiles",
-            "uniform",
-        ]
+        profile_forms = (("--profiles", "uniform"), ("--profiles=uniform",))
+        for profile_args in profile_forms:
+            argv = [
+                "benchmark_flashinfer_sm120_fp8_moe.py",
+                "--rows-per-expert-json",
+                "rows.json",
+                "--cum-m",
+                "256",
+                *profile_args,
+            ]
+            with (
+                self.subTest(profile_args=profile_args),
+                mock.patch.object(sys, "argv", argv),
+                redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                bench.parse_args()
+
+    def test_no_output_error_path_emits_structured_json(self) -> None:
+        bench = load_script("benchmark_flashinfer_sm120_fp8_moe.py")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
         with (
-            mock.patch.object(sys, "argv", argv),
-            redirect_stderr(io.StringIO()),
-            self.assertRaises(SystemExit),
+            mock.patch.object(
+                bench, "collect_environment", side_effect=RuntimeError("boom")
+            ),
+            redirect_stderr(stderr),
+            redirect_stdout(stdout),
         ):
-            bench.parse_args()
+            status = bench.main(
+                [
+                    "--operations",
+                    "gemm1",
+                    "--profiles",
+                    "uniform",
+                    "--cum-m",
+                    "4096",
+                    "--warmup",
+                    "1",
+                    "--iterations",
+                    "1",
+                    "--trials",
+                    "1",
+                ]
+            )
+        self.assertEqual(status, 1)
+        output = stdout.getvalue()
+        self.assertIn("STAGE_1_JSON_BEGIN", output)
+        self.assertIn('"status": "error"', output)
+        self.assertIn("STAGE_1_JSON_END", output)
 
     def test_benchmark_uses_low_level_kernels_without_quant_wrapper(self) -> None:
         source = (
