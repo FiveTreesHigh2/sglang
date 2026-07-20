@@ -1,4 +1,6 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -128,15 +130,19 @@ def _run_triton_reference(
     w13_scale,
     w2_scale,
 ):
-    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
-        fused_experts,
+    from sglang.srt.layers.moe.moe_runner.triton_utils import (
+        fused_moe as triton_fused_moe,
     )
     from sglang.srt.runtime_context import get_context
 
     with get_context().override_server_args(
         enable_deterministic_inference=False
+    ), patch.object(
+        triton_fused_moe,
+        "get_tp_group",
+        return_value=SimpleNamespace(world_size=1),
     ):
-        return fused_experts(
+        return triton_fused_moe.fused_experts(
             dispatch.hidden_states.clone(),
             quant_info.w13_weight,
             quant_info.w2_weight,
