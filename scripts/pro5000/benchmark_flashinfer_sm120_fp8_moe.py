@@ -2,15 +2,22 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import math
+import os
+import platform
 import random
 import statistics
+import subprocess
 import sys
+import time
+import traceback
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from flashinfer_sm120_fp8_smoke import (
     build_offsets,
@@ -561,6 +568,421 @@ def validate_correctness(case: QuantizedCase) -> dict[str, float]:
     }
 
 
+def trial_backend_order(trial_index: int) -> tuple[str, str]:
+    if trial_index < 0:
+        raise ValueError("trial_index must be non-negative")
+    if trial_index % 2 == 0:
+        return ("triton", "flashinfer")
+    return ("flashinfer", "triton")
+
+
+def _run_command(command: Sequence[str]) -> dict[str, Any]:
+    try:
+        completed = subprocess.run(
+            list(command),
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        return {
+            "command": list(command),
+            "returncode": completed.returncode,
+            "stdout": completed.stdout.strip(),
+            "stderr": completed.stderr.strip(),
+        }
+    except Exception as error:
+        return {"command": list(command), "error": repr(error)}
+
+
+def _git_snapshot() -> dict[str, Any]:
+    commit = _run_command(["git", "rev-parse", "HEAD"])
+    branch = _run_command(["git", "branch", "--show-current"])
+    status = _run_command(["git", "status", "--porcelain"])
+    return {
+        "commit": commit.get("stdout"),
+        "branch": branch.get("stdout"),
+        "dirty": bool(status.get("stdout")),
+    }
+
+
+def _package_versions() -> dict[str, str | None]:
+    result: dict[str, str | None] = {}
+    for package in (
+        "torch",
+        "triton",
+        "sglang",
+        "sglang-kernel",
+        "flashinfer-python",
+        "nvidia-cutlass-dsl",
+    ):
+        try:
+            result[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            result[package] = None
+    return result
+
+
+def empty_result_payload(command: Sequence[str]) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "command": list(command),
+        "git": {},
+        "environment": {},
+        "parameters": {},
+        "cases": [],
+        "decision": {"status": "NOT_EVALUATED", "reasons": []},
+        "status": "running",
+    }
+
+
+def collect_environment() -> dict[str, Any]:
+    import torch
+    from flashinfer.grouped_mm import moe_gemm_fp8_nt_groupwise
+
+    del moe_gemm_fp8_nt_groupwise
+    cuda_available = torch.cuda.is_available()
+    return {
+        "platform": platform.platform(),
+        "python_executable": sys.executable,
+        "python_version": sys.version,
+        "packages": _package_versions(),
+        "torch_cuda": torch.version.cuda,
+        "cuda_available": cuda_available,
+        "gpu": torch.cuda.get_device_name() if cuda_available else None,
+        "compute_capability": (
+            list(torch.cuda.get_device_capability()) if cuda_available else None
+        ),
+        "flashinfer_workspace_base": os.environ.get("FLASHINFER_WORKSPACE_BASE"),
+        "flashinfer_disable_jit": os.environ.get("FLASHINFER_DISABLE_JIT"),
+    }
+
+
+def sample_gpu_state() -> dict[str, Any]:
+    fields = (
+        "index",
+        "pstate",
+        "clocks.current.sm",
+        "temperature.gpu",
+        "power.draw",
+        "utilization.gpu",
+        "memory.used",
+    )
+    command = [
+        "nvidia-smi",
+        f"--query-gpu={','.join(fields)}",
+        "--format=csv,noheader,nounits",
+        "--id=0",
+    ]
+    completed = _run_command(command)
+    if completed.get("returncode") != 0:
+        return {"ok": False, **completed}
+    lines = [line.strip() for line in completed.get("stdout", "").splitlines()]
+    if len(lines) != 1:
+        return {
+            "ok": False,
+            **completed,
+            "parse_error": f"expected one GPU row, got {len(lines)}",
+        }
+    values = [value.strip() for value in lines[0].split(",")]
+    if len(values) != len(fields):
+        return {
+            "ok": False,
+            **completed,
+            "parse_error": f"expected {len(fields)} values, got {len(values)}",
+        }
+
+    def parse_number(value: str) -> float | None:
+        try:
+            return float(value)
+        except ValueError:
+            return None
+
+    return {
+        "ok": True,
+        "index": values[0],
+        "pstate": values[1],
+        "sm_clock_mhz": parse_number(values[2]),
+        "temperature_c": parse_number(values[3]),
+        "power_draw_w": parse_number(values[4]),
+        "utilization_percent": parse_number(values[5]),
+        "memory_used_mib": parse_number(values[6]),
+        "raw": lines[0],
+    }
+
+
+def evaluate_gpu_stability(samples: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    if not samples or any(not sample.get("ok") for sample in samples):
+        return {
+            "stable": False,
+            "reasons": ["one or more nvidia-smi samples failed"],
+            "sm_clock_relative_spread": None,
+        }
+    pstates = {sample.get("pstate") for sample in samples}
+    clocks = [sample.get("sm_clock_mhz") for sample in samples]
+    if any(clock is None or clock <= 0 for clock in clocks):
+        return {
+            "stable": False,
+            "reasons": ["one or more SM clock samples were invalid"],
+            "sm_clock_relative_spread": None,
+        }
+    median_clock = statistics.median(clocks)
+    clock_spread = (max(clocks) - min(clocks)) / median_clock
+    reasons = []
+    if len(pstates) != 1:
+        reasons.append("P-state changed during the benchmark")
+    if clock_spread > 0.05:
+        reasons.append("SM clock relative spread exceeded 5%")
+    return {
+        "stable": not reasons,
+        "reasons": reasons,
+        "pstates": sorted(pstates),
+        "sm_clock_relative_spread": clock_spread,
+    }
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    temporary.replace(path)
+
+
+def prepare_backend(fn: Callable[[], None]) -> float:
+    import torch
+
+    torch.cuda.synchronize()
+    started = time.perf_counter()
+    fn()
+    torch.cuda.synchronize()
+    return time.perf_counter() - started
+
+
+def warmup_backend(fn: Callable[[], None], warmup: int) -> None:
+    import torch
+
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+
+
+def time_backend(fn: Callable[[], None], iterations: int) -> float:
+    import torch
+
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iterations):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / iterations
+
+
+def _rows_summary(rows: Sequence[int], block_size_m: int) -> dict[str, Any]:
+    return {
+        "min": min(rows),
+        "max": max(rows),
+        "mean": sum(rows) / len(rows),
+        "zero_experts": sum(value == 0 for value in rows),
+        "small_experts": sum(0 < value < block_size_m for value in rows),
+    }
+
+
+def run_benchmark_case(
+    operation: str,
+    profile: str,
+    rows: Sequence[int],
+    args: argparse.Namespace,
+    *,
+    seed: int,
+) -> dict[str, Any]:
+    import torch
+
+    cum_m = sum(rows)
+    print(
+        f"[prepare] operation={operation} profile={profile} cum_m={cum_m}",
+        flush=True,
+    )
+    case = make_quantized_case(operation, profile, rows, seed=seed)
+    functions = {
+        "triton": lambda: launch_triton(case),
+        "flashinfer": lambda: launch_flashinfer(case),
+    }
+
+    jit_prepare_seconds: dict[str, float] = {}
+    for backend in ("triton", "flashinfer"):
+        print(f"[jit] {backend} {operation}/{profile}/{cum_m}", flush=True)
+        jit_prepare_seconds[backend] = prepare_backend(functions[backend])
+
+    correctness = validate_correctness(case)
+    case.reference = None
+    print(
+        f"[correctness] PASS {operation}/{profile}/{cum_m} "
+        f"triton={correctness['triton_vs_reference']:.3e} "
+        f"flashinfer={correctness['flashinfer_vs_reference']:.3e}",
+        flush=True,
+    )
+
+    for backend in ("triton", "flashinfer"):
+        warmup_backend(functions[backend], args.warmup)
+
+    latencies = {"triton": [], "flashinfer": []}
+    gpu_samples: list[dict[str, Any]] = []
+    for trial_index in range(args.trials):
+        for backend in trial_backend_order(trial_index):
+            before = sample_gpu_state()
+            latency_ms = time_backend(functions[backend], args.iterations)
+            after = sample_gpu_state()
+            latencies[backend].append(latency_ms)
+            gpu_samples.extend(
+                [
+                    {
+                        "trial": trial_index,
+                        "backend": backend,
+                        "phase": "before",
+                        **before,
+                    },
+                    {
+                        "trial": trial_index,
+                        "backend": backend,
+                        "phase": "after",
+                        **after,
+                    },
+                ]
+            )
+            print(
+                f"[trial {trial_index + 1}/{args.trials}] {backend}="
+                f"{latency_ms:.6f} ms",
+                flush=True,
+            )
+
+    triton_summary = summarize_latencies(latencies["triton"])
+    flashinfer_summary = summarize_latencies(latencies["flashinfer"])
+    speedup = (
+        triton_summary["median_ms"] / flashinfer_summary["median_ms"] - 1.0
+    )
+    paired_speedups = [
+        triton_ms / flashinfer_ms - 1.0
+        for triton_ms, flashinfer_ms in zip(
+            latencies["triton"], latencies["flashinfer"]
+        )
+    ]
+    stability = evaluate_gpu_stability(gpu_samples)
+    config = case.triton_config
+    triton_grid_size = math.ceil(
+        case.sorted_token_ids.shape[0] / config["BLOCK_SIZE_M"]
+    ) * math.ceil(case.n / config["BLOCK_SIZE_N"])
+    actual_padded = int(case.num_tokens_post_padded.item())
+
+    result = {
+        "operation": operation,
+        "profile": profile,
+        "cum_m": cum_m,
+        "n": case.n,
+        "k": case.k,
+        "rows_per_expert": list(rows),
+        "rows_summary": _rows_summary(rows, config["BLOCK_SIZE_M"]),
+        "triton_config": config,
+        "triton_grid_size": triton_grid_size,
+        "sorted_token_ids_capacity": case.sorted_token_ids.shape[0],
+        "num_tokens_post_padded": actual_padded,
+        "jit_prepare_seconds": jit_prepare_seconds,
+        "correctness": {"passed": True, **correctness},
+        "latency": {
+            "triton": triton_summary,
+            "flashinfer": flashinfer_summary,
+        },
+        "paired_trial_speedups": paired_speedups,
+        "min_trial_speedup": min(paired_speedups),
+        "speedup": speedup,
+        "historical_reference_ms": OP_SHAPES[operation]["historical_ms"],
+        "gpu_samples": gpu_samples,
+        "gpu_stability": stability,
+    }
+    del case, functions
+    torch.cuda.empty_cache()
+    return result
+
+
+def _case_rows(
+    profile: str,
+    cum_m: int,
+    args: argparse.Namespace,
+) -> list[int]:
+    if args.rows_per_expert_json is not None:
+        return load_rows_per_expert(
+            args.rows_per_expert_json, NUM_EXPERTS, cum_m
+        )
+    if profile == "uniform":
+        return build_uniform_rows(NUM_EXPERTS, cum_m)
+    if profile == "synthetic-skew":
+        return build_synthetic_skew_rows(
+            NUM_EXPERTS, cum_m, seed=args.seed, block_size=64
+        )
+    raise ValueError(f"unsupported profile: {profile}")
+
+
+def _select_decision(
+    cases: Sequence[dict[str, Any]], clock_mode: str
+) -> dict[str, Any]:
+    target = next(
+        (
+            case
+            for case in cases
+            if (case["operation"], case["profile"], case["cum_m"])
+            == TARGET_CASE
+        ),
+        None,
+    )
+    if target is None:
+        return {
+            "status": "NOT_EVALUATED",
+            "reasons": ["the decisive GEMM1/uniform/cum_m=65536 case was not run"],
+        }
+    common = {
+        "speedup": target["speedup"],
+        "triton_relative_spread": target["latency"]["triton"][
+            "relative_spread"
+        ],
+        "flashinfer_relative_spread": target["latency"]["flashinfer"][
+            "relative_spread"
+        ],
+        "correctness_passed": target["correctness"]["passed"],
+    }
+    if clock_mode == "locked":
+        decision = decide_locked(**common)
+    else:
+        decision = decide_default_boost(
+            **common,
+            min_trial_speedup=target["min_trial_speedup"],
+            environment_stable=target["gpu_stability"]["stable"],
+        )
+    return {
+        **decision,
+        "target": {
+            "operation": target["operation"],
+            "profile": target["profile"],
+            "cum_m": target["cum_m"],
+            "speedup": target["speedup"],
+        },
+    }
+
+
+def _print_case_summary(result: dict[str, Any]) -> None:
+    triton_ms = result["latency"]["triton"]["median_ms"]
+    flashinfer_ms = result["latency"]["flashinfer"]["median_ms"]
+    print(
+        f"RESULT {result['operation']} {result['profile']} "
+        f"cum_m={result['cum_m']} triton_ms={triton_ms:.6f} "
+        f"flashinfer_ms={flashinfer_ms:.6f} "
+        f"speedup={result['speedup'] * 100:.2f}% correctness=PASS",
+        flush=True,
+    )
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     parser = argparse.ArgumentParser()
@@ -602,8 +1024,114 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parse_args(argv)
-    raise RuntimeError("GPU benchmark implementation is added in Stage 1 Task 3")
+    args = parse_args(argv)
+    command = [sys.argv[0], *(list(argv) if argv is not None else sys.argv[1:])]
+    payload = empty_result_payload(command)
+    payload["git"] = _git_snapshot()
+    payload["parameters"] = {
+        "operations": args.operations,
+        "profiles": args.profiles,
+        "cum_m": args.cum_m,
+        "warmup": args.warmup,
+        "iterations": args.iterations,
+        "trials": args.trials,
+        "seed": args.seed,
+        "clock_mode": args.clock_mode,
+        "rows_per_expert_json": (
+            str(args.rows_per_expert_json)
+            if args.rows_per_expert_json is not None
+            else None
+        ),
+    }
+    current_stage = "environment"
+    current_case: dict[str, Any] | None = None
+
+    def persist() -> None:
+        if args.output is not None:
+            write_json_atomic(args.output, payload)
+
+    try:
+        if "FLASHINFER_DISABLE_JIT" in os.environ:
+            raise RuntimeError(
+                "FLASHINFER_DISABLE_JIT must be unset for the Stage 1 benchmark"
+            )
+        payload["environment"] = collect_environment()
+        if not payload["environment"]["cuda_available"]:
+            raise RuntimeError("CUDA is not available")
+        if tuple(payload["environment"]["compute_capability"]) not in {
+            (12, 0),
+            (12, 1),
+        }:
+            raise RuntimeError(
+                "Stage 1 requires compute capability 12.0 or 12.1; got "
+                f"{payload['environment']['compute_capability']}"
+            )
+        persist()
+
+        profiles = (
+            ["real-replay"]
+            if args.rows_per_expert_json is not None
+            else args.profiles
+        )
+        current_stage = "benchmark"
+        for operation_index, operation in enumerate(args.operations):
+            for cum_m_index, cum_m in enumerate(args.cum_m):
+                for profile in profiles:
+                    current_case = {
+                        "operation": operation,
+                        "profile": profile,
+                        "cum_m": cum_m,
+                    }
+                    rows = _case_rows(profile, cum_m, args)
+                    case_seed = args.seed + operation_index * 100 + cum_m_index * 10
+                    result = run_benchmark_case(
+                        operation, profile, rows, args, seed=case_seed
+                    )
+                    payload["cases"].append(result)
+                    _print_case_summary(result)
+                    persist()
+
+        payload["decision"] = _select_decision(
+            payload["cases"], args.clock_mode
+        )
+        payload["status"] = "completed"
+        persist()
+        print(f"STAGE_1_DECISION={payload['decision']['status']}", flush=True)
+        print(
+            "STAGE_1_RESULT_JSON="
+            f"{args.output.resolve() if args.output is not None else 'stdout-only'}",
+            flush=True,
+        )
+        return 0
+    except Exception as error:
+        payload["status"] = "error"
+        payload["decision"] = {
+            "status": "ERROR",
+            "reasons": [f"{type(error).__name__}: {error}"],
+        }
+        payload["error"] = {
+            "stage": current_stage,
+            "case": current_case,
+            "type": type(error).__name__,
+            "message": str(error),
+            "traceback": traceback.format_exc(),
+        }
+        try:
+            persist()
+        except Exception as persist_error:
+            print(
+                f"ERROR: failed to write partial JSON: {persist_error}",
+                file=sys.stderr,
+                flush=True,
+            )
+        traceback.print_exc()
+        print("STAGE_1_DECISION=ERROR", flush=True)
+        print(
+            "STAGE_1_RESULT_JSON="
+            f"{args.output.resolve() if args.output is not None else 'stdout-only'}",
+            flush=True,
+        )
+        return 1
 
 
 if __name__ == "__main__":

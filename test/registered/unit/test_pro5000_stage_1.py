@@ -229,6 +229,29 @@ class TestPro5000Stage1(unittest.TestCase):
         self.assertIn("b_scale_triton", source)
         self.assertIn("b_scale_flashinfer", source)
 
+    def test_trial_order_alternates_backends(self) -> None:
+        bench = load_script("benchmark_flashinfer_sm120_fp8_moe.py")
+        self.assertEqual(bench.trial_backend_order(0), ("triton", "flashinfer"))
+        self.assertEqual(bench.trial_backend_order(1), ("flashinfer", "triton"))
+
+    def test_result_schema_has_reproducibility_fields(self) -> None:
+        bench = load_script("benchmark_flashinfer_sm120_fp8_moe.py")
+        payload = bench.empty_result_payload(["benchmark.py"])
+        self.assertGreaterEqual(
+            set(payload),
+            {
+                "schema_version",
+                "timestamp_utc",
+                "command",
+                "git",
+                "environment",
+                "parameters",
+                "cases",
+                "decision",
+                "status",
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
