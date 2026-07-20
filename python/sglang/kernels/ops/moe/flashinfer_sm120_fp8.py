@@ -1,0 +1,170 @@
+from __future__ import annotations
+
+from typing import Optional
+
+import torch
+import triton
+import triton.language as tl
+
+
+def flashinfer_sm120_m_padded(cum_m: int, num_experts: int) -> int:
+    if cum_m < 0 or num_experts <= 0:
+        raise ValueError(
+            "expected cum_m >= 0 and num_experts > 0, got "
+            f"{cum_m=} {num_experts=}"
+        )
+    return ((cum_m + 3 * num_experts) // 4) * 4
+
+
+@triton.jit
+def _pack_flashinfer_sm120_fp8_scale_kernel(
+    source_ptr,
+    topk_ids_ptr,
+    src2dst_ptr,
+    m_indptr_ptr,
+    output_ptr,
+    source_stride_m,
+    source_stride_k,
+    output_stride_k,
+    output_stride_m,
+    num_routes,
+    num_k_blocks,
+    top_k: tl.constexpr,
+    source_is_packed: tl.constexpr,
+    BLOCK_ROUTES: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    routes = tl.program_id(0) * BLOCK_ROUTES + tl.arange(0, BLOCK_ROUTES)
+    k_blocks = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
+    route_mask = routes < num_routes
+    k_mask = k_blocks < num_k_blocks
+
+    experts = tl.load(topk_ids_ptr + routes, mask=route_mask, other=0)
+    dst_rows = tl.load(src2dst_ptr + routes, mask=route_mask, other=0)
+    expert_starts = tl.load(
+        m_indptr_ptr + experts, mask=route_mask, other=0
+    )
+    aligned_starts = ((expert_starts + 3 * experts) // 4) * 4
+    output_cols = aligned_starts + dst_rows - expert_starts
+
+    if source_is_packed:
+        source_rows = dst_rows
+    else:
+        source_rows = routes // top_k
+
+    mask = route_mask[:, None] & k_mask[None, :]
+    source_offsets = (
+        source_rows[:, None] * source_stride_m
+        + k_blocks[None, :] * source_stride_k
+    )
+    values = tl.load(source_ptr + source_offsets, mask=mask, other=0.0)
+    output_offsets = (
+        k_blocks[None, :] * output_stride_k
+        + output_cols[:, None] * output_stride_m
+    )
+    tl.store(output_ptr + output_offsets, values, mask=mask)
+
+
+def pack_flashinfer_sm120_fp8_scale(
+    source_scale: torch.Tensor,
+    topk_ids: torch.Tensor,
+    src2dst: torch.Tensor,
+    m_indptr: torch.Tensor,
+    *,
+    source_is_packed: bool,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if source_scale.dtype != torch.float32 or source_scale.ndim != 2:
+        raise TypeError("source_scale must be a 2D float32 tensor")
+    if not source_scale.is_contiguous():
+        raise ValueError("source_scale must be contiguous")
+    if topk_ids.dtype != torch.int32 or topk_ids.ndim != 2:
+        raise TypeError("topk_ids must be a 2D int32 tensor")
+    if not topk_ids.is_contiguous():
+        raise ValueError("topk_ids must be contiguous")
+    if topk_ids.shape[1] == 0:
+        raise ValueError("topk_ids must have top_k > 0")
+    if (
+        src2dst.dtype != torch.int32
+        or src2dst.ndim != 1
+        or src2dst.numel() != topk_ids.numel()
+    ):
+        raise TypeError(
+            "src2dst must be 1D int32 with one entry per routed slot"
+        )
+    if not src2dst.is_contiguous():
+        raise ValueError("src2dst must be contiguous")
+    if (
+        m_indptr.dtype != torch.int32
+        or m_indptr.ndim != 1
+        or m_indptr.numel() < 2
+    ):
+        raise TypeError(
+            "m_indptr must be contiguous int32 with shape [num_experts + 1]"
+        )
+    if not m_indptr.is_contiguous():
+        raise ValueError(
+            "m_indptr must be contiguous int32 with shape [num_experts + 1]"
+        )
+    tensors = (source_scale, topk_ids, src2dst, m_indptr)
+    if any(tensor.device.type != "cuda" for tensor in tensors):
+        raise ValueError("all scale-layout inputs must be CUDA tensors")
+    if any(tensor.device != source_scale.device for tensor in tensors[1:]):
+        raise ValueError("all scale-layout inputs must be on the same device")
+
+    routes = topk_ids.numel()
+    num_experts = m_indptr.numel() - 1
+    num_k_blocks = source_scale.shape[1]
+    expected_rows = routes if source_is_packed else topk_ids.shape[0]
+    if source_scale.shape[0] != expected_rows:
+        raise ValueError(
+            f"source_scale rows must be {expected_rows}, "
+            f"got {source_scale.shape[0]}"
+        )
+
+    expected_shape = (
+        num_k_blocks,
+        flashinfer_sm120_m_padded(routes, num_experts),
+    )
+    if out is None:
+        out = torch.empty(
+            expected_shape,
+            device=source_scale.device,
+            dtype=torch.float32,
+        )
+    if (
+        out.shape != expected_shape
+        or out.dtype != torch.float32
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "out must be contiguous float32 with shape "
+            f"{expected_shape}, got dtype={out.dtype} shape={tuple(out.shape)}"
+        )
+    if out.device != source_scale.device:
+        raise ValueError("out and scale-layout inputs must be on the same device")
+    if out.data_ptr() % 16 != 0:
+        raise ValueError("FlashInfer A-scale output must be 16-byte aligned")
+
+    out.zero_()
+    if routes > 0 and num_k_blocks > 0:
+        _pack_flashinfer_sm120_fp8_scale_kernel[
+            (triton.cdiv(routes, 32), triton.cdiv(num_k_blocks, 16))
+        ](
+            source_scale,
+            topk_ids,
+            src2dst,
+            m_indptr,
+            out,
+            source_scale.stride(0),
+            source_scale.stride(1),
+            out.stride(0),
+            out.stride(1),
+            routes,
+            num_k_blocks,
+            top_k=topk_ids.shape[1],
+            source_is_packed=source_is_packed,
+            BLOCK_ROUTES=32,
+            BLOCK_K=16,
+        )
+    return out
