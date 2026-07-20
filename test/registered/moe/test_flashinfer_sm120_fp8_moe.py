@@ -131,18 +131,22 @@ def _run_triton_reference(
     from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
         fused_experts,
     )
+    from sglang.srt.runtime_context import get_context
 
-    return fused_experts(
-        dispatch.hidden_states.clone(),
-        quant_info.w13_weight,
-        quant_info.w2_weight,
-        dispatch.topk_output,
-        config,
-        use_fp8_w8a8=True,
-        w1_scale=w13_scale,
-        w2_scale=w2_scale,
-        block_shape=[128, 128],
-    )
+    with get_context().override_server_args(
+        enable_deterministic_inference=False
+    ):
+        return fused_experts(
+            dispatch.hidden_states.clone(),
+            quant_info.w13_weight,
+            quant_info.w2_weight,
+            dispatch.topk_output,
+            config,
+            use_fp8_w8a8=True,
+            w1_scale=w13_scale,
+            w2_scale=w2_scale,
+            block_shape=[128, 128],
+        )
 
 
 @unittest.skipUnless(_IS_SM120, "SM120/SM121 required")
