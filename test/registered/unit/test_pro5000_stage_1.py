@@ -273,6 +273,18 @@ class TestPro5000Stage1(unittest.TestCase):
         self.assertIsNone(re.search(r"python3?\s+-m\s+pip", content))
         self.assertNotIn("rm -rf", content)
 
+    def test_readme_documents_stage_1_without_mandatory_clock_lock(self) -> None:
+        content = (PRO5000_SCRIPTS / "README.md").read_text()
+        self.assertIn("## Stage 1：FP8 MoE kernel 微基准", content)
+        self.assertIn("bash scripts/pro5000/run_stage_1_benchmark.sh", content)
+        self.assertIn("默认 boost 首测", content)
+        self.assertIn("NEEDS_LOCKED_RERUN", content)
+        self.assertIn("1732 MHz", content)
+        self.assertIn("条件锁频", content)
+        self.assertIn("uv pip --python", content)
+        stage_1 = content.split("## Stage 1：FP8 MoE kernel 微基准", 1)[1]
+        self.assertNotIn("FLASHINFER_DISABLE_JIT=1", stage_1)
+
 
 if __name__ == "__main__":
     unittest.main()
