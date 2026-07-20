@@ -226,3 +226,144 @@ CUDA toolkit `13.0`、GPU compute capability `12.0` 和运行时 SM clock
 - `packages-before.txt`、`packages-after.txt`。
 
 这些文件用于同时判断 kernel 正确性、性能、GPU 运行状态和 venv 是否被意外改变。
+
+## Stage 2：完整 FP8 MoE runner 基准
+
+Stage 2 测量的是完整 MoE runner，不是 Stage 1 的单独 GEMM。计时范围包含 input
+quant、expert permute、A-scale layout、GEMM1、SwiGLU、第二次 quant/layout、
+GEMM2 和 unpermute/combine。FlashInfer 与 Triton 使用完全相同的 FP8 权重、
+block scale、hidden states、top-k IDs 和 top-k weights。
+
+默认 workload 使用 Qwen3.5-A3B 的单卡目标 shape：`E=256`、hidden size
+`2048`、intermediate size `512`、`top_k=8`。`tokens=8192` 对应
+`routed_rows=65536`，是固定的 chunked-prefill 主判定 case。
+
+wrapper 不安装或升级依赖，不执行 `pip`，不锁定 GPU 频率，也不修改旧 venv。
+只读依赖检查继续使用 `uv pip --python`。当前 checkout 是 editable 安装，更新
+feature commit 后通常不需要重复执行 bootstrap 或安装 SGLang。
+
+### 1. 更新到精确 feature commit
+
+```bash
+cd /home/logs/sennian/pro5000-fi-moe/sglang
+test -z "$(git status --porcelain)"
+git fetch origin feat/flashinfer-sm120-fp8-moe
+git switch --detach origin/feat/flashinfer-sm120-fp8-moe
+git rev-parse HEAD
+git status --short --branch
+```
+
+### 2. 运行 CPU 契约测试
+
+```bash
+VENV_PY=/home/logs/sennian/pro5000-fi-moe/.venv/bin/python3
+
+"${VENV_PY}" -m pytest \
+  test/registered/unit/test_pro5000_stage_2.py \
+  -q
+```
+
+该测试不启动目标 GPU kernel，检查 CLI、合法 top-k 路由、固定主判定 case、结果
+schema、wrapper 不修改依赖且不锁频。
+
+### 3. 先运行缩小的完整 runner preflight
+
+```bash
+cd /home/logs/sennian/pro5000-fi-moe/sglang
+export FLASHINFER_WORKSPACE_BASE=/home/logs/sennian/pro5000-fi-moe/cache/flashinfer-workspace-base
+unset FLASHINFER_DISABLE_JIT
+
+/home/logs/sennian/pro5000-fi-moe/.venv/bin/python3 \
+  scripts/pro5000/benchmark_flashinfer_sm120_fp8_runner.py \
+  --tokens 1 8 \
+  --top-k 8 \
+  --profiles synthetic-skew \
+  --warmup 2 \
+  --trials 1 \
+  --iterations 5 \
+  --check-cuda-graph \
+  --output-json /tmp/pro5000-stage2-preflight.json
+```
+
+脚本首先构造一次共享的 `E=256` blockwise FP8 权重，并每完成 32 个 expert 打印
+一条 `[prepare]` 进度。首次目标 kernel JIT 也可能耗时；看到持续的权重量化或 JIT
+阶段时不要中断。这个缩小命令不含 `tokens=8192, uniform`，所以最终
+`STAGE_2_DECISION=NOT_EVALUATED` 是预期结果；所有列出的 correctness 和 CUDA
+Graph 必须为 `PASS`。
+
+### 4. 执行默认 Stage 2 benchmark
+
+preflight 通过后运行：
+
+```bash
+cd /home/logs/sennian/pro5000-fi-moe/sglang
+unset FLASHINFER_DISABLE_JIT
+bash scripts/pro5000/run_stage_2_benchmark.sh
+```
+
+默认 wrapper 依次执行 CUTLASS 目标 shape runtime preflight、CUDA Graph 动态路由
+replay，以及以下两种 routing profile 的完整 runner 对照：
+
+```text
+tokens:   1 8 128 8192 16384
+profiles: uniform synthetic-skew
+backends: triton flashinfer_sm120_fp8；CUTLASS preflight 可用时再加入 cutlass
+```
+
+CUTLASS 实际调用不可用时会记录 `CUTLASS_UNAVAILABLE` 和完整 traceback，但不会
+跳过 FlashInfer/Triton correctness 和性能测试，也不会把失败伪造成 0 ms。
+
+结束时输出：
+
+- `STAGE_2_STATUS`：Python benchmark 退出码；
+- `STAGE_2_WRAPPER_STATUS`：包含 before/after 环境检查的 wrapper 退出码；
+- `STAGE_2_RUN_DIR`：本次完整产物目录。
+
+两个 status 都应为 `0`。查看结果：
+
+```bash
+RUN_DIR="$(ls -1dt /home/logs/sennian/pro5000-fi-moe/runs/stage-2-* | head -n1)"
+sed -n '1,360p' "${RUN_DIR}/stdout.txt"
+sed -n '1,360p' "${RUN_DIR}/stderr.txt"
+sed -n '1,1200p' "${RUN_DIR}/benchmark.json"
+```
+
+### 5. 解读 Stage 2 决策
+
+- `GO`：所有完整 runner correctness 和 CUDA Graph 通过；固定
+  `tokens=8192, uniform` case 相对 Triton 至少加速 10%；所有 `tokens=1/8`
+  decode case 的最坏回退不超过 5%。
+- `FUNCTIONAL_ONLY`：功能与 CUDA Graph 正确，但主 prefill 收益不足 10%，或
+  decode 最坏回退超过 5%。backend 保持显式实验选项，不自动按 token 数切换到
+  Triton。
+- `NO_GO`：任一 correctness 或 CUDA Graph 检查失败。
+- `NOT_EVALUATED`：自定义参数没有包含固定主 case 或 decode case；用于小规模
+  preflight，不是正式性能结论。
+
+component profile 记录 production FlashInfer runner 内各 CUDA 操作的时间，排除
+Python 与 allocator 的 host 时间；完整 runner 的 backend latency 才是性能判定
+依据。
+
+### 6. GPU 频率检查
+
+Stage 2 wrapper 本身不会锁频。运行前后可用以下只读命令检查当前频率和 P-state：
+
+```bash
+nvidia-smi \
+  --query-gpu=index,pstate,clocks.current.sm,clocks.max.sm,clocks.applications.sm \
+  --format=csv,noheader,nounits
+```
+
+只有默认 boost 结果接近边界、并且确认 GPU 独占后，才另行进行用户批准的锁频
+复测；锁频不属于本 wrapper。
+
+### 7. 打包结果返回本地
+
+```bash
+RUN_DIR=/home/logs/sennian/pro5000-fi-moe/runs/stage-2-<timestamp>-<commit>
+tar -C "$(dirname "${RUN_DIR}")" -czf \
+  /tmp/pro5000-stage2.tar.gz "$(basename "${RUN_DIR}")"
+```
+
+返回压缩包即可。它包含 `benchmark.json`、stdout/stderr、before/after 环境、
+`uv pip check`、package freeze 和 `nvidia-smi` 记录。
