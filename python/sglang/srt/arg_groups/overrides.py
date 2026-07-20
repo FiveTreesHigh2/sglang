@@ -1910,6 +1910,26 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     disable_shared_experts_fusion writes (post-publish writers exist for that
     field) stay in the handler."""
     moe_runner_backend = view.moe_runner_backend
+    if moe_runner_backend == "flashinfer_sm120_fp8":
+        if view.quantization not in (None, "fp8"):
+            raise ValueError(
+                "flashinfer_sm120_fp8 requires an autodetected or explicit "
+                "blockwise FP8 checkpoint (--quantization fp8)."
+            )
+        if view.tp_size != 1:
+            raise ValueError("flashinfer_sm120_fp8 requires tp_size=1.")
+        if view.ep_size != 1:
+            raise ValueError("flashinfer_sm120_fp8 requires ep_size=1.")
+        if view.moe_a2a_backend != "none":
+            raise ValueError(
+                "flashinfer_sm120_fp8 requires moe_a2a_backend=none."
+            )
+        if bool(view.enable_lora) or bool(view.lora_paths):
+            raise ValueError("flashinfer_sm120_fp8 does not support LoRA.")
+        if view.enable_two_batch_overlap:
+            raise ValueError("flashinfer_sm120_fp8 does not support TBO.")
+        if view.enable_single_batch_overlap:
+            raise ValueError("flashinfer_sm120_fp8 does not support SBO.")
     if view.quantization == "nvfp4_online":
         if not is_sm100_supported():
             raise ValueError(

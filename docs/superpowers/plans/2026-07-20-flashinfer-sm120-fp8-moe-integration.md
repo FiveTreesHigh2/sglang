@@ -135,6 +135,7 @@ def test_backend_is_registered():
     ("override", "message"),
     [
         ({"quantization": "modelopt_fp8"}, "blockwise FP8"),
+        ({"quantization": "mxfp8"}, "blockwise FP8"),
         ({"tp_size": 2}, "tp_size=1"),
         ({"ep_size": 2}, "ep_size=1"),
         ({"moe_a2a_backend": "deepep"}, "moe_a2a_backend=none"),
@@ -215,7 +216,7 @@ Run:
 python3 -m pytest test/registered/unit/layers/moe/test_flashinfer_sm120_fp8_config.py -q
 ```
 
-Expected: `10 passed`。
+Expected: `11 passed`。
 
 Commit:
 
