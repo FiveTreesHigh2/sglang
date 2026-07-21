@@ -81,8 +81,8 @@ decode 使用生产中的 CUDA Graph replay 延迟，prefill 使用 eager 延迟
 
 ### 3.1 采用：独立 CUDA JIT 三合一 adapter
 
-新增专用 CUDA JIT kernel，复用 SGLang 现有
-`silu_mul_quant_contig_kernel` 已验证的基础逻辑：
+新增专用 CUDA JIT kernel 变体，借用 SGLang 现有
+`silu_mul_quant_contig_kernel` 已验证的计算和向量化基础逻辑：
 
 - BF16 gate/up 向量化加载；
 - SwiGLU 计算；
@@ -90,10 +90,18 @@ decode 使用生产中的 CUDA Graph replay 延迟，prefill 使用 eager 延迟
 - E4M3 FP8 scale 和 payload 生成；
 - FP8 向量化写回。
 
-新 kernel 只增加两项目标 backend 所需逻辑：
+现有 `kTransposed` 分支不能直接复用：它由 static assert 限制为 UE8M0，并按
+int32/byte packing 写出 4 个 exponent，不支持普通 FP32 scale。新变体不得尝试放开
+该分支，而是独立实现以下三项 FlashInfer 专用逻辑：
 
-1. 使用 `topk_ids/src2dst/m_indptr` 将 packed row 映射到 FlashInfer scale 列；
-2. 在同一 launch 中重写动态 padding 为零。
+1. 对源 routed slot `r` 执行 `dst = src2dst[r]`，从 `gate_up[dst]` 读取并写回
+   `down_input[dst]`；
+2. 使用 `topk_ids/m_indptr/dst` 计算 per-expert 4-row-aligned 列，直接写出
+   `[G, m_padded]` FP32 scale；
+3. 在同一 launch 中重写动态 padding 为零。
+
+真正复用的是 SwiGLU、128-group reduction、E4M3 conversion、向量化 load/store 和
+一行一个 block 的调度骨架；scale 写出和 routed-row 寻址属于新实现。
 
 该实现位于 SGLang，不改变或 fork FlashInfer 源码。
 
@@ -342,6 +350,20 @@ fused_swiglu_quant_pack_gemm2
 `gemm2_input_prepare` 在两个版本中都表示 GEMM1 输出到 GEMM2 输入就绪的总 GPU
 时间。逐组件 CUDA Event 会改变小 kernel 调度，只用于瓶颈定位，不参与性能 gate。
 
+检查点 A 的 profiler 必须同时理解尚未出现 fused symbol 的旧 runner，以及检查点 B
+调用新 adapter 的 runner。实现不得继续假设 quant/pack 一定各调用两次，也不能只因
+通用 quant/pack symbol 存在就判断为旧路径；新路径仍会在 GEMM1 使用这些函数。
+profiler 应为所有当前可用 stage 注册 hook，根据实际调用轨迹生成且仅生成以下之一：
+
+```text
+legacy detail: quant1, moe_permute, scale_pack_gemm1, silu, quant2,
+               scale_pack_gemm2
+fused detail:  quant1, moe_permute, scale_pack_gemm1,
+               fused_swiglu_quant_pack_gemm2
+```
+
+任何缺失、重复或两套 detail 混合都应使组件诊断显式失败，而不是输出误标数据。
+
 ### 8.3 判定口径
 
 正确性和 CUDA Graph 均通过后：
@@ -383,6 +405,8 @@ NO_GO:
 3. tokens=8192、uniform 的 prefill 判定继续读取 eager 字段。
 4. decode graph 缺失时不能产生 `GO`。
 5. 组件 detail 不同，但 rollup keys 在旧/新路径间稳定。
+6. 用两个 fake runner/call-trace fixture 分别覆盖 legacy detail 和 fused detail，确保
+   检查点 A 的同一份 benchmark 代码在检查点 B 无需改变统计语义。
 
 ### 9.2 GPU adapter 测试
 
@@ -393,8 +417,10 @@ NO_GO:
 4. 覆盖 top-k 1、2、8，空 expert 和 skew 路由。
 5. 覆盖不同 token 重复选择同一 expert，以及同一 token 内重复 expert ID 的边界
    输入。
-6. 复用同一输出 buffer，在路由改变后再次调用，检查不存在旧 padding 残留。
-7. 检查输出 dtype、shape、contiguous 和 16-byte scale 对齐。
+6. 构造明确非 identity 的 `src2dst`，分别检查 input 从 `gate_up[dst]` 读取、payload
+   写到 `down_input[dst]`，而不是错误使用 `blockIdx.x` 对应的源行。
+7. 复用同一输出 buffer，在路由改变后再次调用，检查不存在旧 padding 残留。
+8. 检查输出 dtype、shape、contiguous 和 16-byte scale 对齐。
 
 常规 top-k router 通常为同一 token 返回不同 expert，但 adapter 不把这一点作为输入
 契约。同一 token 内出现重复 expert ID 时，每个 routed slot 仍由 `src2dst` 映射到
@@ -428,6 +454,10 @@ CUDA Graph 测试必须在同一 capture 上 replay 至少两组不同 hidden st
 - tokens=8192、uniform eager baseline；
 - CUDA Graph 动态路由正确性。
 
+该提交同时包含 legacy/fused 两套组件 call-trace 的 CPU 契约测试和可选 fused hook；
+旧 runner 上 fused hook 未被调用属于正常情况。检查点 B 不得通过修改组件定义来制造
+不可比较的结果。
+
 结果留档后才进入融合提交。这样 decode 的 graph 性能变化不会与 benchmark 口径
 变化混在一起。
 
@@ -449,25 +479,61 @@ stdout、stderr 和环境信息。若融合仍未达到 GO 门槛，保留测量
 
 ## 11. 风险与控制
 
-### 11.1 数值差异
+### 11.1 Prefill 性能预算
+
+tokens=8192、top-k=8 时，`M=65536, N=512` 的 BF16 中间张量大小为 64 MiB；写入
+一次再由 quant 读取一次产生约 128 MiB（134 MB）流量。按 1.3 TB/s 粗略估计，完全
+消除这部分 HBM 流量的上界收益约为 `0.10 ms`：
+
+```text
+1.933 - 0.10 = 1.833 ms
+2.0636 / 1.833 - 1 = 约 12.6%
+```
+
+但该估算不是验收预言：中间张量可能部分命中 L2，新 kernel 的 gather/scatter 和
+padding 写出也会消耗指令与带宽。达到 10% 所需的 FlashInfer 延迟为：
+
+```text
+2.06355 / 1.10 = 1.87595 ms
+```
+
+即相对当前 `1.93307 ms` 至少节省约 `0.0571 ms`。本轮具备越过 prefill 门槛的
+可能，但默认预期应是测量后在 `GO` 与 `FUNCTIONAL_ONLY` 之间作出判断；若结果为
+9.x%，按既定纪律进入后续 GEMM1 优化，不放宽阈值。
+
+现有 `routing_quant_pack=0.24594 ms` 是 quant1、路由排序/permute、A1 zero/pack 的
+合计，不能在细分测量前把全部时间归因于 A1。
+
+### 11.2 数值差异
 
 CUDA JIT 的 fast-math 与现有独立 activation 路径可能产生细微差异。控制方式是先
 比较 adapter 与现有 fused quant 参照，再验证完整 runner 三个指标；不要求不同
 实现的 BF16 中间值逐 bit 相同。
 
-### 11.2 小 decode 的 kernel 下限
+### 11.3 小 decode 的 kernel 下限
 
 融合可以减少 glue launch，但不能消除 FlashInfer GEMM 本身在小 M 下的固定开销。
 即使 prefill 达到 10%，decode graph 仍可能超过 5% 门槛。该结果应如实保留为
 `FUNCTIONAL_ONLY`，而不是在本轮增加未设计的双路径。
 
-### 11.3 JIT 和部署
+当前 tokens=8、uniform 的组件诊断中，FlashInfer GEMM1/GEMM2 合计约
+`0.1305 + 0.0704 = 0.2009 ms`，已经接近 Triton 完整 eager runner 的约
+`0.197 ms`。组件 CUDA Event 会扰动小 kernel，因此这不是最终 graph 结论，但足以
+说明 decode 过线不应作为默认预期。CUDA Graph 能减少 CPU 提交间隙，却不会把多个
+GPU kernel 合并，也不会消除 FlashInfer GEMM 的 device 侧执行时间。
+
+现有数据不能证明 `0.1305 ms` 主要由“扫描全部 256 个 expert”导致：tokens=8 的
+synthetic-skew 有更多空 expert，却把 GEMM1 降至约 `0.0836 ms`。当前对照更符合
+active expert/tile 数和权重工作集共同变化；scheduler 扫描、L2 和 tile 贡献需要
+独立 profiler 或 A/B patch 才能定因。
+
+### 11.4 JIT 和部署
 
 新 adapter 增加一个 SGLang CUDA JIT module。服务器已有 CUDA 13.0 NVCC，运行
 环境允许 JIT。部署启动或 graph capture 前必须完成 warmup；JIT 构建失败时显式
 终止，不能切换旧实现。
 
-### 11.4 性能归因
+### 11.5 性能归因
 
 已有 Stage 2 artifact 使用 eager decode，不能作为新 graph decode 的直接基线。
 必须先在 benchmark-only commit 上生成检查点 A，再与融合 commit 比较。
