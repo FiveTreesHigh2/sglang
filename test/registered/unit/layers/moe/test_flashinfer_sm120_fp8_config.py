@@ -61,6 +61,22 @@ def test_backend_accepts_fp8_or_autodetected_quantization():
     assert _moe_runner_backend_quant_constraints(_view(quantization=None)) == {}
 
 
+def test_unquantized_method_rejects_flashinfer_sm120_fp8_runner():
+    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+    from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+
+    with patch(
+        "sglang.srt.layers.quantization.unquant.get_moe_runner_backend",
+        return_value=MoeRunnerBackend.FLASHINFER_SM120_FP8,
+    ), pytest.raises(
+        ValueError,
+        match=r"requires blockwise FP8.*unquantized MoE is unsupported",
+    ):
+        UnquantizedFusedMoEMethod().create_moe_runner(
+            torch.nn.Module(), MoeRunnerConfig()
+        )
+
+
 def test_weight_scale_conversion_is_transpose_contiguous():
     from sglang.srt.layers.moe.moe_runner.flashinfer_sm120_fp8 import (
         prepare_flashinfer_sm120_fp8_weight_scales,

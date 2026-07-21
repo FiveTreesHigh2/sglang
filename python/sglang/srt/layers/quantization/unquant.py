@@ -460,6 +460,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        if get_moe_runner_backend().is_flashinfer_sm120_fp8():
+            raise ValueError(
+                "flashinfer_sm120_fp8 requires blockwise FP8 weights; "
+                "unquantized MoE is unsupported."
+            )
         self.moe_runner_config = moe_runner_config
         if self.use_flashinfer_trtllm_moe:
             backend = (
