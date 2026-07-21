@@ -28,7 +28,6 @@ def _jit_flashinfer_sm120_fp8_moe_module(use_pdl: bool) -> Module:
                 f"FlashInferSm120Fp8SiluQuantPackKernel<{args}>::run",
             )
         ],
-        extra_cuda_cflags=["--use_fast_math"],
     )
 
 

@@ -9,6 +9,7 @@
 
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 
+#include <cmath>
 #include <cstdint>
 #include <cuda_fp8.h>
 
@@ -33,9 +34,13 @@ SGL_DEVICE fp32x2_t flashinfer_sm120_fp8_silu_and_mul(bf16x2_t gate, bf16x2_t up
   using namespace device;
   const auto [g0, g1] = cast<fp32x2_t>(gate);
   const auto [u0, u1] = cast<fp32x2_t>(up);
-  const auto silu0 = g0 / (1.0f + __expf(-g0));
-  const auto silu1 = g1 / (1.0f + __expf(-g1));
-  return {silu0 * u0, silu1 * u1};
+  const auto silu0 = g0 / (1.0f + expf(-g0));
+  const auto silu1 = g1 / (1.0f + expf(-g1));
+
+  // Match the legacy production path exactly: the standalone activation
+  // kernel stores SwiGLU to BF16 before the generic FP8 quant kernel reads it.
+  const auto rounded = cast<bf16x2_t>(fp32x2_t{silu0 * u0, silu1 * u1});
+  return cast<fp32x2_t>(rounded);
 }
 
 template <bool kUsePDL>
@@ -75,7 +80,7 @@ __global__ __launch_bounds__(1024, 2) void flashinfer_sm120_fp8_silu_quant_pack_
       gate_vec.load(input, vector_id);
       up_vec.load(input, vector_id + vectors_per_half);
 
-      float local_max = 0.0f;
+      float local_max = 1e-10f;
       float results[8];
 #pragma unroll
       for (uint32_t i = 0; i < 4; ++i) {
@@ -88,11 +93,12 @@ __global__ __launch_bounds__(1024, 2) void flashinfer_sm120_fp8_silu_quant_pack_
       constexpr uint32_t kWorkMask = (1u << kWorkThreads) - 1u;
       const uint32_t work_mask = kWorkMask << ((threadIdx.x % device::kWarpThreads) / kWorkThreads * kWorkThreads);
       local_max = warp::reduce_max<kWorkThreads>(local_max, work_mask);
-      scale = fmaxf(local_max, 1e-10f) / math::FP8_E4M3_MAX;
-      const float inv_scale = 1.0f / scale;
+      constexpr float kMaxInv = 1.0f / math::FP8_E4M3_MAX;
+      scale = local_max * kMaxInv;
+      const float quant_multiplier = math::FP8_E4M3_MAX / local_max;
 #pragma unroll
       for (uint32_t i = 0; i < 4; ++i) {
-        out_vec[i] = pack_fp8(results[2 * i] * inv_scale, results[2 * i + 1] * inv_scale);
+        out_vec[i] = pack_fp8(results[2 * i] * quant_multiplier, results[2 * i + 1] * quant_multiplier);
       }
     }
 
