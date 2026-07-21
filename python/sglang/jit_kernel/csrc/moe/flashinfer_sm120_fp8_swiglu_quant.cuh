@@ -95,7 +95,9 @@ __global__ __launch_bounds__(1024, 2) void flashinfer_sm120_fp8_silu_quant_pack_
       local_max = warp::reduce_max<kWorkThreads>(local_max, work_mask);
       constexpr float kMaxInv = 1.0f / math::FP8_E4M3_MAX;
       scale = local_max * kMaxInv;
-      const float quant_multiplier = math::FP8_E4M3_MAX / local_max;
+      // Generic FP8 quant is compiled with --use_fast_math. Keep activation
+      // expf precise, but reproduce its fast division at FP8 rounding edges.
+      const float quant_multiplier = __fdividef(math::FP8_E4M3_MAX, local_max);
 #pragma unroll
       for (uint32_t i = 0; i < 4; ++i) {
         out_vec[i] = pack_fp8(results[2 * i] * quant_multiplier, results[2 * i + 1] * quant_multiplier);
