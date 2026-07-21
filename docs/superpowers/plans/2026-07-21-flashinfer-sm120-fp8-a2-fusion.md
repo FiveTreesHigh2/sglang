@@ -930,7 +930,8 @@ from sglang.srt.layers.moe.moe_runner import (
 from sglang.kernels.ops.moe.flashinfer_sm120_fp8 import (
     fused_swiglu_quant_pack_flashinfer_sm120_fp8 as fused_adapter,
 )
-from sglang.srt.layers.activation import silu_and_mul as legacy_silu
+
+legacy_silu = getattr(flashinfer_runner, "silu_and_mul", None)
 
 topk_ids = (
     torch.arange(16, device="cuda", dtype=torch.int32)
@@ -970,7 +971,9 @@ self.assertEqual(silu.call_count, 0)
 因为 RED 时 runner module 还没有新 symbol，测试先从 public ops module 取新 adapter，
 再用 `patch.object(..., create=True)` 注入 runner module；这能让当前 runner 正常运行并以
 `fused.call_count == 0`、旧 quant/pack 各 2 次的预期原因失败。GREEN 后同一 patch 会覆盖
-runner 已导入的 symbol，无需分叉测试代码。目标断言：
+runner 已导入的 symbol，无需分叉测试代码。旧 `silu_and_mul` 必须从 runner 当前绑定
+取得：RED 时 `wraps` 的就是实际生产调用，GREEN 删除 import 后则为 `None`，此时
+`patch.object(..., wraps=None, create=True)` 只注入不会被正确路径调用的 mock。目标断言：
 
 ```text
 new fused adapter: 1 次
@@ -979,7 +982,9 @@ generic pack:       1 次（仅 GEMM1）
 old silu_and_mul:   0 次
 ```
 
-Expected RED: 当前 runner 不调用新 adapter，通用 quant/pack 各调用两次。
+Expected RED: runner 完整执行成功，然后仅在调用次数断言处失败：当前 runner 不调用新
+adapter，通用 quant/pack 各调用两次、旧 `silu_and_mul` 一次。若提前出现 `TypeError`、
+数值错误或其他异常，视为 RED 测试本身错误，先修测试，不能进入 production 接线。
 
 - [ ] **Step 2: 替换 runner 的四步 A2 路径**
 
