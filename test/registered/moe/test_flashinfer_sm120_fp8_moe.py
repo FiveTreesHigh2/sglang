@@ -432,6 +432,317 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
         )
         torch.testing.assert_close(out, expected)
 
+    def test_fused_swiglu_quant_pack_matches_contig_reference(self):
+        from sglang.jit_kernel.dsv4 import (
+            silu_and_mul_contig_post_quant,
+        )
+        from sglang.kernels.ops.moe.flashinfer_sm120_fp8 import (
+            fused_swiglu_quant_pack_flashinfer_sm120_fp8,
+            pack_flashinfer_sm120_fp8_scale,
+        )
+
+        torch.manual_seed(17)
+        tokens, top_k, experts, hidden = 8, 2, 8, 512
+        topk_ids = torch.tensor(
+            [
+                [3, 0],
+                [1, 1],
+                [7, 2],
+                [0, 6],
+                [5, 3],
+                [4, 0],
+                [6, 6],
+                [2, 7],
+            ],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        _, src2dst, m_indptr = moe_permute(
+            torch.zeros(
+                (tokens, 128),
+                device="cuda",
+                dtype=torch.float8_e4m3fn,
+            ),
+            topk_ids,
+            experts,
+        )
+        self.assertFalse(
+            torch.equal(
+                src2dst,
+                torch.arange(
+                    tokens * top_k,
+                    device="cuda",
+                    dtype=torch.int32,
+                ),
+            )
+        )
+
+        gate_up = torch.randn(
+            (tokens * top_k, hidden * 2),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        ref_q = torch.empty(
+            (tokens * top_k, hidden),
+            device="cuda",
+            dtype=torch.float8_e4m3fn,
+        )
+        ref_scale = torch.empty(
+            (tokens * top_k, hidden // 128),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        silu_and_mul_contig_post_quant(
+            gate_up,
+            ref_q,
+            ref_scale,
+            128,
+        )
+        expected_scale = pack_flashinfer_sm120_fp8_scale(
+            ref_scale,
+            topk_ids,
+            src2dst,
+            m_indptr,
+            source_is_packed=True,
+        )
+
+        actual_q, actual_scale = (
+            fused_swiglu_quant_pack_flashinfer_sm120_fp8(
+                gate_up,
+                topk_ids,
+                src2dst,
+                m_indptr,
+            )
+        )
+        torch.testing.assert_close(
+            actual_q.view(torch.uint8),
+            ref_q.view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            actual_scale,
+            expected_scale,
+            rtol=1e-6,
+            atol=0,
+        )
+
+    def test_fused_swiglu_quant_pack_reused_outputs_clear_padding(self):
+        from sglang.jit_kernel.dsv4 import (
+            silu_and_mul_contig_post_quant,
+        )
+        from sglang.kernels.ops.moe.flashinfer_sm120_fp8 import (
+            fused_swiglu_quant_pack_flashinfer_sm120_fp8,
+            pack_flashinfer_sm120_fp8_scale,
+        )
+
+        torch.manual_seed(23)
+        experts, tokens, top_k, hidden = 8, 4, 2, 512
+        routes = (
+            torch.tensor(
+                [[0, 0], [0, 1], [1, 1], [1, 1]],
+                device="cuda",
+                dtype=torch.int32,
+            ),
+            torch.tensor(
+                [[7, 7], [6, 7], [5, 6], [4, 7]],
+                device="cuda",
+                dtype=torch.int32,
+            ),
+        )
+        actual_q = torch.empty(
+            (tokens * top_k, hidden),
+            device="cuda",
+            dtype=torch.float8_e4m3fn,
+        )
+        actual_scale = torch.full(
+            (
+                hidden // 128,
+                ((tokens * top_k + 3 * experts) // 4) * 4,
+            ),
+            float("nan"),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        q_ptr = actual_q.data_ptr()
+        scale_ptr = actual_scale.data_ptr()
+
+        for topk_ids in routes:
+            with self.subTest(topk_ids=topk_ids.cpu().tolist()):
+                _, src2dst, m_indptr = moe_permute(
+                    torch.zeros(
+                        (tokens, 128),
+                        device="cuda",
+                        dtype=torch.float8_e4m3fn,
+                    ),
+                    topk_ids,
+                    experts,
+                )
+                gate_up = torch.randn(
+                    (tokens * top_k, hidden * 2),
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                )
+                ref_q = torch.empty_like(actual_q)
+                ref_scale = torch.empty(
+                    (tokens * top_k, hidden // 128),
+                    device="cuda",
+                    dtype=torch.float32,
+                )
+                silu_and_mul_contig_post_quant(
+                    gate_up,
+                    ref_q,
+                    ref_scale,
+                    128,
+                )
+                expected_scale = pack_flashinfer_sm120_fp8_scale(
+                    ref_scale,
+                    topk_ids,
+                    src2dst,
+                    m_indptr,
+                    source_is_packed=True,
+                )
+
+                returned_q, returned_scale = (
+                    fused_swiglu_quant_pack_flashinfer_sm120_fp8(
+                        gate_up,
+                        topk_ids,
+                        src2dst,
+                        m_indptr,
+                        out=actual_q,
+                        out_scale=actual_scale,
+                    )
+                )
+                self.assertEqual(returned_q.data_ptr(), q_ptr)
+                self.assertEqual(returned_scale.data_ptr(), scale_ptr)
+                torch.testing.assert_close(
+                    returned_q.view(torch.uint8),
+                    ref_q.view(torch.uint8),
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(
+                    returned_scale,
+                    expected_scale,
+                    rtol=1e-6,
+                    atol=0,
+                )
+                padding_mask = expected_scale == 0
+                self.assertTrue(bool(padding_mask.any()))
+                self.assertTrue(
+                    torch.equal(
+                        returned_scale[padding_mask],
+                        torch.zeros_like(returned_scale[padding_mask]),
+                    )
+                )
+
+    def test_fused_swiglu_quant_pack_route_profiles(self):
+        from sglang.jit_kernel.dsv4 import (
+            silu_and_mul_contig_post_quant,
+        )
+        from sglang.kernels.ops.moe.flashinfer_sm120_fp8 import (
+            fused_swiglu_quant_pack_flashinfer_sm120_fp8,
+            pack_flashinfer_sm120_fp8_scale,
+        )
+
+        torch.manual_seed(29)
+        experts, hidden = 8, 512
+        profiles = (
+            torch.tensor(
+                [[0], [0], [7], [3]],
+                device="cuda",
+                dtype=torch.int32,
+            ),
+            torch.tensor(
+                [[3, 3], [0, 7], [3, 0], [7, 7]],
+                device="cuda",
+                dtype=torch.int32,
+            ),
+            torch.tensor(
+                [
+                    [0, 1, 2, 3, 4, 5, 6, 7],
+                    [7, 7, 6, 5, 4, 3, 2, 0],
+                ],
+                device="cuda",
+                dtype=torch.int32,
+            ),
+        )
+
+        for topk_ids in profiles:
+            tokens, top_k = topk_ids.shape
+            with self.subTest(top_k=top_k):
+                _, src2dst, m_indptr = moe_permute(
+                    torch.zeros(
+                        (tokens, 128),
+                        device="cuda",
+                        dtype=torch.float8_e4m3fn,
+                    ),
+                    topk_ids,
+                    experts,
+                )
+                gate_up = torch.randn(
+                    (tokens * top_k, hidden * 2),
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                )
+                ref_q = torch.empty(
+                    (tokens * top_k, hidden),
+                    device="cuda",
+                    dtype=torch.float8_e4m3fn,
+                )
+                ref_scale = torch.empty(
+                    (tokens * top_k, hidden // 128),
+                    device="cuda",
+                    dtype=torch.float32,
+                )
+                silu_and_mul_contig_post_quant(
+                    gate_up,
+                    ref_q,
+                    ref_scale,
+                    128,
+                )
+                expected_scale = pack_flashinfer_sm120_fp8_scale(
+                    ref_scale,
+                    topk_ids,
+                    src2dst,
+                    m_indptr,
+                    source_is_packed=True,
+                )
+
+                actual_q, actual_scale = (
+                    fused_swiglu_quant_pack_flashinfer_sm120_fp8(
+                        gate_up,
+                        topk_ids,
+                        src2dst,
+                        m_indptr,
+                    )
+                )
+                torch.testing.assert_close(
+                    actual_q.view(torch.uint8),
+                    ref_q.view(torch.uint8),
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(
+                    actual_scale,
+                    expected_scale,
+                    rtol=1e-6,
+                    atol=0,
+                )
+                self.assertEqual(actual_q.dtype, torch.float8_e4m3fn)
+                self.assertEqual(actual_q.shape, (tokens * top_k, hidden))
+                self.assertTrue(actual_q.is_contiguous())
+                self.assertEqual(actual_scale.dtype, torch.float32)
+                self.assertEqual(
+                    actual_scale.shape,
+                    (
+                        hidden // 128,
+                        ((tokens * top_k + 3 * experts) // 4) * 4,
+                    ),
+                )
+                self.assertTrue(actual_scale.is_contiguous())
+                self.assertEqual(actual_scale.data_ptr() % 16, 0)
+
     def test_full_runner_correctness(self):
         correctness_failures = []
         cases = [
