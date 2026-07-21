@@ -743,6 +743,56 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
                 self.assertTrue(actual_scale.is_contiguous())
                 self.assertEqual(actual_scale.data_ptr() % 16, 0)
 
+    def test_full_runner_uses_single_fused_a2_prepare(self):
+        from sglang.kernels.ops.moe.flashinfer_sm120_fp8 import (
+            fused_swiglu_quant_pack_flashinfer_sm120_fp8 as fused_adapter,
+        )
+        from sglang.srt.layers.moe.moe_runner import (
+            flashinfer_sm120_fp8 as flashinfer_runner,
+        )
+
+        legacy_silu = getattr(flashinfer_runner, "silu_and_mul", None)
+        topk_ids = (
+            torch.arange(16, device="cuda", dtype=torch.int32)
+            .remainder(16)
+            .view(8, 2)
+        )
+        dispatch, config, quant_info, _, _ = _make_runner_case(
+            8,
+            2,
+            topk_ids,
+        )
+
+        with patch.object(
+            flashinfer_runner,
+            "fused_swiglu_quant_pack_flashinfer_sm120_fp8",
+            wraps=fused_adapter,
+            create=True,
+        ) as fused, patch.object(
+            flashinfer_runner,
+            "sglang_per_token_group_quant_fp8",
+            wraps=flashinfer_runner.sglang_per_token_group_quant_fp8,
+        ) as quant, patch.object(
+            flashinfer_runner,
+            "pack_flashinfer_sm120_fp8_scale",
+            wraps=flashinfer_runner.pack_flashinfer_sm120_fp8_scale,
+        ) as pack_scale, patch.object(
+            flashinfer_runner,
+            "silu_and_mul",
+            wraps=legacy_silu,
+            create=True,
+        ) as silu:
+            flashinfer_runner.fused_experts_none_to_flashinfer_sm120_fp8(
+                dispatch,
+                quant_info,
+                config,
+            )
+
+        self.assertEqual(fused.call_count, 1)
+        self.assertEqual(quant.call_count, 1)
+        self.assertEqual(pack_scale.call_count, 1)
+        self.assertEqual(silu.call_count, 0)
+
     def test_full_runner_correctness(self):
         correctness_failures = []
         cases = [
