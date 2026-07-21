@@ -6,9 +6,9 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.activation import silu_and_mul
 from sglang.kernels.ops.moe.ep_moe_kernels import moe_permute, moe_unpermute
 from sglang.kernels.ops.moe.flashinfer_sm120_fp8 import (
+    fused_swiglu_quant_pack_flashinfer_sm120_fp8,
     pack_flashinfer_sm120_fp8_scale,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
@@ -275,25 +275,11 @@ def fused_experts_none_to_flashinfer_sm120_fp8(
         gate_up,
     )
 
-    # The v2 quant kernel only fuses SiLU+mul for column-major UE8M0 scales;
-    # FlashInfer requires row-major float scales, so keep these as two ops.
-    down_input_bf16 = torch.empty(
-        packed_hidden.shape[0],
-        quant_info.w2_weight.shape[2],
-        device=hidden_states.device,
-        dtype=torch.bfloat16,
-    )
-    silu_and_mul(gate_up, out=down_input_bf16)
-    down_input, down_scale = sglang_per_token_group_quant_fp8(
-        down_input_bf16,
-        128,
-    )
-    a2_scale_fi = pack_flashinfer_sm120_fp8_scale(
-        down_scale,
+    down_input, a2_scale_fi = fused_swiglu_quant_pack_flashinfer_sm120_fp8(
+        gate_up,
         topk_ids,
         src2dst,
         m_indptr,
-        source_is_packed=True,
     )
     down_output = torch.empty(
         packed_hidden.shape[0],

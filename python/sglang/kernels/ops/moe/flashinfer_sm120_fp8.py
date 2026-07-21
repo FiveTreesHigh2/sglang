@@ -6,6 +6,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.jit_kernel.flashinfer_sm120_fp8_moe import (
+    flashinfer_sm120_fp8_silu_quant_pack,
+)
+
 
 def flashinfer_sm120_m_padded(cum_m: int, num_experts: int) -> int:
     if cum_m < 0 or num_experts <= 0:
@@ -279,10 +283,6 @@ def fused_swiglu_quant_pack_flashinfer_sm120_fp8(
         )
     if out_scale.data_ptr() % 16 != 0:
         raise ValueError("FlashInfer A-scale output must be 16-byte aligned")
-
-    from sglang.jit_kernel.flashinfer_sm120_fp8_moe import (
-        flashinfer_sm120_fp8_silu_quant_pack,
-    )
 
     flashinfer_sm120_fp8_silu_quant_pack(
         gate_up,
