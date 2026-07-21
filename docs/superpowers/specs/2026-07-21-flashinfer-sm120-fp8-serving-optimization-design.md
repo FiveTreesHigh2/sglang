@@ -1,6 +1,6 @@
 # RTX PRO 5000：FlashInfer SM120 FP8 MoE 服务 Prefill 优化设计
 
-**状态：** 对话设计已批准，待书面规范审阅
+**状态：** 书面规范已批准，待实施计划
 
 **日期：** 2026-07-21
 
@@ -282,14 +282,30 @@ FlashInfer GEMM1 的 `m_indptr`、weight、weight scale、`out=` 和输出 dtype
 对每个 token 的每个连续 128 元素 group：
 
 ```text
-absmax    = max(max(abs(value)), 1e-10)
-scale     = absmax / 448.0
-quantized = E4M3(clamp(value / scale, -448.0, 448.0))
+absmax           = max(max(abs(value)), 1e-10)
+scale            = absmax * (1.0 / 448.0)
+quant_multiplier = __fdividef(448.0, absmax)
+quantized        = E4M3(clamp(value * quant_multiplier, -448.0, 448.0))
 ```
 
-必须与现有 `sglang_per_token_group_quant_fp8` 的非 fast-math 结果保持一致。一个 token
-选择多个 expert 时，量化结果可复用，但每个 routed slot 都必须写到自己的 `dst`；同一
-token 内出现重复 expert ID 也不得破坏映射或覆盖其他 routed slot。
+参照物是固定生产环境中 `sglang_per_token_group_quant_fp8(hidden_states, 128)` 实际选择的
+legacy JIT v2 路径，不是 Triton quant kernel。该 JIT v2 使用 `--use_fast_math`；A2 的既有
+验证表明，FP8 rounding edge 要使用 `__fdividef(448.0, absmax)` 产生 quant multiplier，
+而不是先计算 `scale` 后执行 `value / scale`，也不能改成 `__fdiv_rn` 真除。
+
+新模块不得依赖 NVCC 对普通 `/` 的隐式 lowering。与 reference 对齐所需的近似除法用
+显式 intrinsic 表达；其他运算是否使用 fast-math 逐项决定，不能仅通过全局增加或删除
+`--use_fast_math` 推断数值等价。测试必须记录实际 legacy dispatch，防止环境变量或未来
+SGLang 变更悄悄换掉参照实现。
+
+首要要求是 scale 和 FP8 payload 与该固定 reference bitwise 一致。只有完成逐级诊断并
+证明剩余 payload 差异来自无法消除的编译器 lowering、而不是运算顺序、rounding、索引或
+实现错误时，才允许经过单独人工审核，把 payload 单测降级为反量化后的严格容差；scale、
+padding、完整 runner 数值门槛和 CUDA Graph 契约不得放宽，也不得在测试失败时自动切换
+判断标准。
+
+一个 token 选择多个 expert 时，量化结果可复用，但每个 routed slot 都必须写到自己的
+`dst`；同一 token 内出现重复 expert ID 也不得破坏映射或覆盖其他 routed slot。
 
 ### 5.5 Scale 列映射与 padding
 
@@ -313,6 +329,23 @@ scale_col     = aligned_start + dst - expert_start
 首版使用二维逻辑调度：token/group 负责量化，内部沿 `top_k` scatter payload 和 scale。
 具体 block 形状由实现阶段的 microbenchmark 选择，但只能依赖 `T/E/top_k/K` 等通用
 shape，不得读取模型名或对 4096、6144 等输入长度分支。
+
+同一个 kernel grid 在主计算区域之外额外附加 E 个 expert padding block，或采用严格
+等价的单-launch 机制。expert `e` 的 padding block 计算：
+
+```text
+start       = m_indptr[e]
+end         = m_indptr[e + 1]
+aligned     = ((start + 3 * e) // 4) * 4
+valid_end   = aligned + end - start
+next        = m_padded                                      # e == E - 1
+              or ((end + 3 * (e + 1)) // 4) * 4            # otherwise
+gap         = next - valid_end
+```
+
+只有 `gap != 0` 时才允许计算 `i / gap`、`i % gap` 并写零；`gap == 0` 必须直接跳过，
+避免除零。padding block 在每次普通调用和每次 CUDA Graph replay 都执行，不依赖旧 buffer
+内容，也不增加独立的 `zero_()` launch。
 
 如果直接沿 `top_k` scatter 导致写合并差，允许用同一 launch 中的分阶段 block 组织或
 增加通用的 destination 排序利用，但不得重新引入完整 `q_hidden/q_scale` 中间张量。所有
@@ -356,6 +389,18 @@ work_counter    = 0
 所有 workspace 都位于 GPU 并可复用。不得把 `total_tiles` 或 expert rows 复制回 host。
 GEMM persistent CTA 通过 device atomic counter 取得逻辑 tile id，再在 `tile_indptr` 上
 做 GPU binary search 得到 expert 和该 expert 内的 tile，跳过空 expert 的线性遍历。
+
+`work_counter` 的重置责任属于每次 grouped GEMM 调用，不能只在 workspace 创建或 graph
+capture 前初始化一次。prepare kernel 必须由指定 thread 在 device 上写入
+`work_counter = 0`；prepare kernel 完成后，同一 CUDA stream 才能发射 persistent GEMM。
+该 `prepare/reset -> GEMM` 顺序必须整体进入 CUDA Graph，因此每次 replay 都重新生成任务
+表并重置 counter。也允许使用被 graph capture 的 device memset，但不允许 host store、
+`.item()` 或同步读取。
+
+可复用 workspace 必须归属于独立 runner/graph execution，或通过其他明确机制保证
+stream-safe；两个并发 stream 或 graph replay 不得无保护地共享同一个 counter 和任务表。
+binary search 的设计复杂度记为 `O(log E)`，不把特定 `E=256` 下的理论读取次数写成固定
+实现契约。
 
 该 prepare 成本必须计入完整 runner 和服务时间；不能只测修改后的 GEMM kernel。
 
@@ -409,7 +454,9 @@ moe_gemm_fp8_nt_groupwise(
 1. CPU contract：backend 选择、量化限制、环境开关、错误信息；
 2. GPU adapter：`top_k=1/2/8`、uniform、skew、空 expert、重复 expert ID；
 3. 不同 `T/E/K`，其中 `K % 128 == 0`；
-4. FP8 payload bitwise 对齐 legacy，FP32 scale 采用严格误差检查；
+4. 断言当前环境实际选择预期的 legacy JIT v2 reference；FP8 payload 和 FP32 scale 首先
+   要求 bitwise 对齐。只有按 5.4 完成根因证明和人工审核后，payload 才可改用预先固定的
+   反量化严格容差；
 5. 重用输出 buffer 时 padding 每次都正确清零；
 6. 完整 runner 与 Triton 的现有数值阈值；
 7. CUDA Graph 多次 replay，hidden、路由和空 expert 分布均变化；
