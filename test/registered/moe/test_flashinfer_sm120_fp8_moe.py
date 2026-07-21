@@ -432,13 +432,14 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
         )
         torch.testing.assert_close(out, expected)
 
-    def test_fused_swiglu_quant_pack_matches_contig_reference(self):
-        from sglang.jit_kernel.dsv4 import (
-            silu_and_mul_contig_post_quant,
-        )
+    def test_fused_swiglu_quant_pack_matches_legacy_reference(self):
+        from sglang.jit_kernel.activation import silu_and_mul
         from sglang.kernels.ops.moe.flashinfer_sm120_fp8 import (
             fused_swiglu_quant_pack_flashinfer_sm120_fp8,
             pack_flashinfer_sm120_fp8_scale,
+        )
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
         )
 
         torch.manual_seed(17)
@@ -482,20 +483,14 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
             device="cuda",
             dtype=torch.bfloat16,
         )
-        ref_q = torch.empty(
+        ref_bf16 = torch.empty(
             (tokens * top_k, hidden),
             device="cuda",
-            dtype=torch.float8_e4m3fn,
+            dtype=torch.bfloat16,
         )
-        ref_scale = torch.empty(
-            (tokens * top_k, hidden // 128),
-            device="cuda",
-            dtype=torch.float32,
-        )
-        silu_and_mul_contig_post_quant(
-            gate_up,
-            ref_q,
-            ref_scale,
+        silu_and_mul(gate_up, out=ref_bf16)
+        ref_q, ref_scale = sglang_per_token_group_quant_fp8(
+            ref_bf16,
             128,
         )
         expected_scale = pack_flashinfer_sm120_fp8_scale(
@@ -528,12 +523,13 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
         )
 
     def test_fused_swiglu_quant_pack_reused_outputs_clear_padding(self):
-        from sglang.jit_kernel.dsv4 import (
-            silu_and_mul_contig_post_quant,
-        )
+        from sglang.jit_kernel.activation import silu_and_mul
         from sglang.kernels.ops.moe.flashinfer_sm120_fp8 import (
             fused_swiglu_quant_pack_flashinfer_sm120_fp8,
             pack_flashinfer_sm120_fp8_scale,
+        )
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
         )
 
         torch.manual_seed(23)
@@ -583,16 +579,14 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
                     device="cuda",
                     dtype=torch.bfloat16,
                 )
-                ref_q = torch.empty_like(actual_q)
-                ref_scale = torch.empty(
-                    (tokens * top_k, hidden // 128),
+                ref_bf16 = torch.empty(
+                    (tokens * top_k, hidden),
                     device="cuda",
-                    dtype=torch.float32,
+                    dtype=torch.bfloat16,
                 )
-                silu_and_mul_contig_post_quant(
-                    gate_up,
-                    ref_q,
-                    ref_scale,
+                silu_and_mul(gate_up, out=ref_bf16)
+                ref_q, ref_scale = sglang_per_token_group_quant_fp8(
+                    ref_bf16,
                     128,
                 )
                 expected_scale = pack_flashinfer_sm120_fp8_scale(
@@ -637,12 +631,13 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
                 )
 
     def test_fused_swiglu_quant_pack_route_profiles(self):
-        from sglang.jit_kernel.dsv4 import (
-            silu_and_mul_contig_post_quant,
-        )
+        from sglang.jit_kernel.activation import silu_and_mul
         from sglang.kernels.ops.moe.flashinfer_sm120_fp8 import (
             fused_swiglu_quant_pack_flashinfer_sm120_fp8,
             pack_flashinfer_sm120_fp8_scale,
+        )
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
         )
 
         torch.manual_seed(29)
@@ -685,20 +680,14 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
                     device="cuda",
                     dtype=torch.bfloat16,
                 )
-                ref_q = torch.empty(
+                ref_bf16 = torch.empty(
                     (tokens * top_k, hidden),
                     device="cuda",
-                    dtype=torch.float8_e4m3fn,
+                    dtype=torch.bfloat16,
                 )
-                ref_scale = torch.empty(
-                    (tokens * top_k, hidden // 128),
-                    device="cuda",
-                    dtype=torch.float32,
-                )
-                silu_and_mul_contig_post_quant(
-                    gate_up,
-                    ref_q,
-                    ref_scale,
+                silu_and_mul(gate_up, out=ref_bf16)
+                ref_q, ref_scale = sglang_per_token_group_quant_fp8(
+                    ref_bf16,
                     128,
                 )
                 expected_scale = pack_flashinfer_sm120_fp8_scale(
