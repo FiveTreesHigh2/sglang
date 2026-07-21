@@ -12,6 +12,27 @@ SCRIPT = Path(__file__).parents[3] / "scripts/pro5000/benchmark_flashinfer_sm120
 INPUT_LENGTHS = (4096, 6144, 14336, 30720, 63488)
 SEEDS = (17, 29, 43)
 NUM_PROMPTS = 100
+FIXED_SERVER_FIELDS = (
+    "model_path",
+    "served_model_name",
+    "dtype",
+    "quantization",
+    "kv_cache_dtype",
+    "tp_size",
+    "dp_size",
+    "ep_size",
+    "pp_size",
+    "disable_radix_cache",
+    "mem_fraction_static",
+    "attention_backend",
+    "prefill_attention_backend",
+    "reasoning_parser",
+    "tool_call_parser",
+    "chunked_prefill_size",
+    "fp8_gemm_runner_backend",
+    "moe_runner_backend",
+    "enable_metrics",
+)
 
 
 def load_bench():
@@ -110,10 +131,11 @@ def test_build_run_key_changes_for_each_contract_dimension(
 def test_defaults_and_server_snapshot_include_all_fixed_fields(bench):
     assert bench.INPUT_LENGTHS == INPUT_LENGTHS
     assert bench.SEEDS == SEEDS
+    assert bench.FIXED_SERVER_FIELDS == FIXED_SERVER_FIELDS
 
     info = server_info()
     snapshot = bench.verify_server_info(info, "triton")
-    assert snapshot == {field: info[field] for field in bench.FIXED_SERVER_FIELDS}
+    assert snapshot == {field: info[field] for field in FIXED_SERVER_FIELDS}
 
 
 @pytest.mark.parametrize(
@@ -193,11 +215,32 @@ def compare(bench, ratios):
     )
 
 
-def test_compare_accepts_4096_at_exact_ten_percent_median_boundary(bench):
+@pytest.mark.parametrize(
+    ("speedups", "accepted"),
+    (
+        ((0.10, 0.10, 0.10), True),
+        ((0.099999, 0.099999, 0.20), False),
+    ),
+)
+def test_4096_speedup_gate_accepts_exact_boundary_and_rejects_lower_median(
+    bench, speedups, accepted
+):
+    assert bench.evaluate_speedup_gate(4096, speedups) is accepted
+
+
+def test_compare_uses_speedup_gate_for_each_input_length(bench, monkeypatch):
+    calls = []
+
+    def gate(input_length, speedups):
+        calls.append((input_length, tuple(speedups)))
+        return input_length != 4096
+
+    monkeypatch.setattr(bench, "evaluate_speedup_gate", gate)
     result = compare(bench, passing_ratios())
 
-    assert result["decision"] == "GO"
-    assert result["by_input_length"]["4096"]["median_speedup"] == pytest.approx(0.10)
+    assert result["decision"] == "FUNCTIONAL_ONLY"
+    assert [input_length for input_length, _ in calls] == list(INPUT_LENGTHS)
+    assert all(len(speedups) == len(SEEDS) for _, speedups in calls)
 
 
 def test_compare_rejects_4096_median_below_ten_percent(bench):
@@ -217,13 +260,16 @@ def test_compare_rejects_4096_when_any_seed_regresses(bench, seed_index):
     assert compare(bench, ratios)["decision"] == "FUNCTIONAL_ONLY"
 
 
-@pytest.mark.parametrize("input_length, seed_index", product(INPUT_LENGTHS[1:], range(len(SEEDS))))
-def test_compare_requires_strictly_positive_improvement_for_every_non4096_seed(
-    bench, input_length, seed_index
+@pytest.mark.parametrize(
+    "input_length, seed_index, ratio",
+    product(INPUT_LENGTHS[1:], range(len(SEEDS)), (1.0, 0.99)),
+)
+def test_compare_rejects_zero_or_negative_improvement_for_every_non4096_seed(
+    bench, input_length, seed_index, ratio
 ):
     ratios = passing_ratios()
     samples = list(ratios[input_length])
-    samples[seed_index] = 1.0
+    samples[seed_index] = ratio
     ratios[input_length] = tuple(samples)
 
     assert compare(bench, ratios)["decision"] == "FUNCTIONAL_ONLY"
@@ -363,6 +409,8 @@ def test_capture_runs_warmup_and_all_formal_cases_with_fixed_bench_contract(
         assert command[command.index("--backend") + 1] == "sglang"
         assert command[command.index("--dataset-name") + 1] == "random"
         assert command[command.index("--random-output-len") + 1] == "1"
+        assert command[command.index("--random-range-ratio") + 1] == "1"
+        assert "--flush-cache" in command
 
     warmup = next(
         command
