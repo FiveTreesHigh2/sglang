@@ -537,3 +537,102 @@ active expert/tile 数和权重工作集共同变化；scheduler 扫描、L2 和
 
 已有 Stage 2 artifact 使用 eager decode，不能作为新 graph decode 的直接基线。
 必须先在 benchmark-only commit 上生成检查点 A，再与融合 commit 比较。
+
+## 附录 A：实验结果（2026-07-21 Stage 2）
+
+### A.1 归档、提交与环境
+
+下列结论只来自已归档的服务器 Stage 2 实测，不改变第 8.3 节的判定阈值。
+两次运行都在干净的 detached commit 上完成：
+
+| 角色 | artifact | 完整 commit |
+| --- | --- | --- |
+| legacy / 检查点 A | `pro5000-a2-legacy-a70e7a7fa.tar.gz` | `a70e7a7fa156521d7a300e23e54bdfdbb1cb89d8` |
+| fused / 检查点 C | `pro5000-stage2-fused-029231034.tar.gz` | `0292310347b9028e01bcad2ea6a050e27e698107` |
+
+环境在两次运行前后保持一致：单卡 NVIDIA RTX PRO 5000 72GB Blackwell（SM120，driver
+580.126.09），CUDA / PyTorch CUDA 13.0，NVCC 13.0.48，Python 3.12.3，PyTorch
+2.11.0，FlashInfer `0.6.15.dev20260716`，SGLang
+`0.0.0.dev15380+g8d7dbe85e`，`sglang-kernel` 0.4.4，`nvidia-cutlass-dsl` 4.5.2。
+其中 SGLang 版本字符串来自 editable 安装的旧 metadata；实际 clean detached checkout
+和 benchmark 代码版本以本附录列出的归档 Git commit 为准。
+两次 `pip check` 都报告全部 199 个包兼容；运行前 GPU 没有其他进程。
+
+### A.2 计时口径与正确性
+
+正式命令使用 tokens `1, 8, 128, 8192, 16384`、`top_k=8`、`uniform` 和
+`synthetic-skew` profile、10 次 warmup、5 个 trial、每 trial 100 次 iteration，且
+Triton 与 FlashInfer trial 交替执行。表中的 eager 值为各 backend 的 5-trial median。
+
+tokens=1、8 另外为每个 backend 单独 capture CUDA Graph；graph 值为只包含
+`graph.replay()` 的 5-trial median，不含输入 `copy_`、路由生成、capture 或结果 clone。
+tokens>=128（包括 prefill 主 case）只采用 eager。CUDA Graph 动态路由检查在 tokens=8
+的 case profile 和 alternate profile 上各注入一组新的 hidden state/routing，各 replay
+1 次并与对应 eager 输出精确比较；随后在同一 captured graph 上另 replay 20 次，只检查
+allocated memory 未增长。该检查状态为 PASS；allocated memory 为 805,982,720 bytes，
+前后相同。
+
+两份 artifact 的 10 个 case 均为 correctness PASS，且沿用既有阈值：`calc_diff <
+0.005`、`symmetric_diff < 1e-4`、`normalized_rmse < 0.01`。下文的
+`CUTLASS_UNAVAILABLE` 表示可选 CUTLASS preflight 在 SM120 没有
+`fp8_blockwise_scaled_grouped_mm` 实现；它不是 FlashInfer 融合接入失败，也不改变
+FlashInfer 的正确性、CUDA Graph 或性能结论。
+
+### A.3 主 case 与融合收益
+
+prefill 主 case（tokens=8192、uniform、65536 routed rows）采用 eager：
+
+| 版本 | Triton median (ms) | FlashInfer median (ms) | FlashInfer 相对 Triton |
+| --- | ---: | ---: | ---: |
+| legacy | 2.064245 | 1.932612 | +6.81% |
+| fused | 2.072597 | 1.863326 | +11.23% |
+
+融合后该主 case 的 FlashInfer eager 从 1.932612 ms 降至 1.863326 ms（-3.59%）；相对
+Triton 的 prefill 加速从 +6.81% 提升至 +11.23%。decode 的判定则以 graph 为准：fused
+tokens=1/uniform 为 Triton 0.030738 ms、FlashInfer 0.065583 ms（FlashInfer 相对 Triton
+慢 113.41%）；tokens=8/uniform 为 0.189974 / 0.221139 ms（慢 16.39%）。完整 graph
+矩阵见下一节。
+
+同一 prefill 主 case 的 CUDA Event 组件 rollup 如下（只用于瓶颈归因，不用于 gate）：
+
+| rollup | legacy (ms) | fused (ms) | 变化 |
+| --- | ---: | ---: | ---: |
+| `gemm1_input_prepare` | 0.242667 | 0.241528 | -0.47% |
+| `gemm1` | 0.777366 | 0.780392 | +0.39% |
+| `gemm2_input_prepare` | 0.179554 | 0.110930 | -38.22% |
+| `gemm2` | 0.506451 | 0.516027 | +1.89% |
+| `unpermute_combine` | 0.241549 | 0.227200 | -5.94% |
+
+legacy 的 `gemm2_input_prepare` 由 `silu` 0.124701 ms、`quant2` 0.041706 ms 和
+`scale_pack_gemm2` 0.013147 ms 构成；fused 路径将这三项替换为单个
+`fused_swiglu_quant_pack_gemm2` 0.110930 ms。因此观测到的融合直接收益是该 rollup
+减少 0.068624 ms（-38.22%）；其他 rollup 的小幅变化保留为实测值，不归因于该 kernel。
+
+### A.4 Fused 正式 10-case 矩阵
+
+`加速`为 `(Triton / FlashInfer - 1)`；graph 栏仅适用于 decode tokens=1、8，`—` 表示该
+case 未 capture graph。所有行 correctness 均为 PASS，CUTLASS 均为
+`CUTLASS_UNAVAILABLE`。
+
+| tokens | profile | Triton eager (ms) | FlashInfer eager (ms) | eager 加速 | Triton graph (ms) | FlashInfer graph (ms) | graph 加速 |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | uniform | 0.164527 | 0.127587 | +28.95% | 0.030738 | 0.065583 | -53.13% |
+| 1 | synthetic-skew | 0.163801 | 0.126478 | +29.51% | 0.030745 | 0.065613 | -53.14% |
+| 8 | uniform | 0.196740 | 0.233244 | -15.65% | 0.189974 | 0.221139 | -14.09% |
+| 8 | synthetic-skew | 0.166251 | 0.162808 | +2.11% | 0.116561 | 0.150896 | -22.75% |
+| 128 | uniform | 0.701619 | 0.727914 | -3.61% | — | — | — |
+| 128 | synthetic-skew | 0.702604 | 0.760069 | -7.56% | — | — | — |
+| 8192 | uniform | 2.072597 | 1.863326 | +11.23% | — | — | — |
+| 8192 | synthetic-skew | 2.321024 | 2.357720 | -1.56% | — | — | — |
+| 16384 | uniform | 4.263069 | 3.666719 | +16.26% | — | — | — |
+| 16384 | synthetic-skew | 4.453563 | 4.156506 | +7.15% | — | — | — |
+
+### A.5 最终判定与适用范围
+
+最终状态为 `FUNCTIONAL_ONLY`。融合后的 prefill 主 case 已达到既定的 +10% 门槛
+（+11.23%），正确性和 CUDA Graph 动态路由检查也均通过；但 graph decode 的最大
+regression 为 +113.41%，超过既定的 5% 上限。因此不能标记为 `GO`，也没有更改阈值。
+
+`FUNCTIONAL_ONLY` 只表示本轮性能 gate 的结果，不等于自动启用“仅 prefill”路径，也不
+表示已实现按 token 数自动调度。当前只要选择 `flashinfer_sm120_fp8` backend，仍会同时
+覆盖 prefill 和 decode；本轮没有加入 runtime fallback 或 prefill-only 自动切换。
