@@ -89,8 +89,8 @@ E4M3 FP8 activation/weight、FP32 block scale，并输出 BF16。已完成的验
 python -m sglang.bench_serving
 --backend sglang
 --dataset-name random
---random-input <input_length>
---random-output 1
+--random-input-len <input_length>
+--random-output-len 1
 --random-range-ratio 1
 --num-prompts 100
 --flush-cache
