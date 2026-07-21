@@ -236,6 +236,23 @@ class TestPro5000Stage2(unittest.TestCase):
         self.assertEqual(payload["command"], ["benchmark.py", "--tokens", "8"])
         self.assertEqual(payload["status"], "running")
 
+    def test_case_result_distinguishes_skipped_cutlass(self) -> None:
+        bench = load_script("benchmark_flashinfer_sm120_fp8_runner.py")
+        components = {key: 0.1 for key in bench.COMPONENT_KEYS}
+
+        result = bench.build_case_result(
+            tokens=8,
+            top_k=8,
+            profile="uniform",
+            correctness={"status": "PASS"},
+            triton_trials=[1.0],
+            flashinfer_trials=[0.9],
+            components_ms=components,
+            cutlass_status="SKIPPED",
+        )
+
+        self.assertEqual(result["cutlass"], {"status": "SKIPPED"})
+
     def test_cli_rejects_non_positive_work_sizes(self) -> None:
         bench = load_script("benchmark_flashinfer_sm120_fp8_runner.py")
         for argv in (

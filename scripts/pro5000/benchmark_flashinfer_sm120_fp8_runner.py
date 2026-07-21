@@ -212,6 +212,7 @@ def build_case_result(
     flashinfer_trials: Sequence[float],
     components_ms: dict[str, float],
     cutlass_trials: Sequence[float] | None = None,
+    cutlass_status: str = "CUTLASS_UNAVAILABLE",
 ) -> dict[str, Any]:
     if set(components_ms) != set(COMPONENT_KEYS):
         raise ValueError(
@@ -236,7 +237,7 @@ def build_case_result(
     result["cutlass"] = (
         summarize_latencies(cutlass_trials)
         if cutlass_trials is not None
-        else {"status": "CUTLASS_UNAVAILABLE"}
+        else {"status": cutlass_status}
     )
     return result
 
@@ -906,6 +907,7 @@ def run_benchmark_case(
     trials: int,
     iterations: int,
     cutlass_state: CutlassState | None,
+    cutlass_status: str,
 ) -> dict[str, Any]:
     import torch
 
@@ -964,6 +966,7 @@ def run_benchmark_case(
         flashinfer_trials=latencies["flashinfer_sm120_fp8"],
         components_ms=components,
         cutlass_trials=latencies.get("cutlass"),
+        cutlass_status=cutlass_status,
     )
     result["component_profile_iterations"] = component_iterations
     result["component_scope"] = (
@@ -1072,6 +1075,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         persist()
 
         cutlass_state: CutlassState | None = None
+        cutlass_status = "SKIPPED"
         if args.cutlass_preflight:
             current_stage = "cutlass-preflight"
             print(
@@ -1091,6 +1095,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 preflight_case,
                 candidate_state,
             )
+            cutlass_status = payload["cutlass_preflight"]["status"]
             if payload["cutlass_preflight"]["status"] == "CUTLASS_AVAILABLE":
                 cutlass_state = candidate_state
             print(
@@ -1154,6 +1159,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     trials=args.trials,
                     iterations=args.iterations,
                     cutlass_state=cutlass_state,
+                    cutlass_status=cutlass_status,
                 )
                 payload["cases"].append(result)
                 _print_case_summary(result)
