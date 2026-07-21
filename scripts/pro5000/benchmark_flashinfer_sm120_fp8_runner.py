@@ -27,14 +27,67 @@ NUM_EXPERTS = 256
 HIDDEN_SIZE = 2048
 INTERMEDIATE_SIZE = 512
 BLOCK_SHAPE = (128, 128)
-COMPONENT_KEYS = (
-    "routing_quant_pack",
+COMMON_COMPONENT_DETAIL_KEYS = frozenset(
+    (
+        "quant1",
+        "moe_permute",
+        "scale_pack_gemm1",
+        "gemm1",
+        "gemm2",
+        "unpermute_combine",
+    )
+)
+LEGACY_COMPONENT_EXTRA_KEYS = frozenset(
+    ("silu", "quant2", "scale_pack_gemm2")
+)
+FUSED_COMPONENT_EXTRA_KEYS = frozenset(
+    ("fused_swiglu_quant_pack_gemm2",)
+)
+COMPONENT_ROLLUP_KEYS = (
+    "gemm1_input_prepare",
     "gemm1",
-    "swiglu_quant",
-    "scale_layout_gemm2",
+    "gemm2_input_prepare",
     "gemm2",
     "unpermute_combine",
 )
+LEGACY_COMPONENT_TRACE = (
+    "quant1",
+    "moe_permute",
+    "scale_pack_gemm1",
+    "gemm1",
+    "silu",
+    "quant2",
+    "scale_pack_gemm2",
+    "gemm2",
+    "unpermute_combine",
+)
+FUSED_COMPONENT_TRACE = (
+    "quant1",
+    "moe_permute",
+    "scale_pack_gemm1",
+    "gemm1",
+    "fused_swiglu_quant_pack_gemm2",
+    "gemm2",
+    "unpermute_combine",
+)
+LEGACY_COMPONENT_CALL_COUNTS = {
+    "quant": 2,
+    "pack": 2,
+    "gemm": 2,
+    "moe_permute": 1,
+    "unpermute_combine": 1,
+    "silu": 1,
+    "fused": 0,
+}
+FUSED_COMPONENT_CALL_COUNTS = {
+    "quant": 1,
+    "pack": 1,
+    "gemm": 2,
+    "moe_permute": 1,
+    "unpermute_combine": 1,
+    "silu": 0,
+    "fused": 1,
+}
 FULL_MEAN_ABS_REL_TOL = 5e-3
 FULL_SYMMETRIC_DIFF_TOL = 1e-4
 FULL_NORMALIZED_RMSE_TOL = 1e-2
@@ -60,6 +113,12 @@ class RunnerCase:
     config: Any
     quant_info: Any
     shared_weights: SharedWeights
+
+
+@dataclass
+class CapturedGraph:
+    graph: Any
+    output: Any
 
 
 @dataclass
@@ -154,13 +213,26 @@ def select_decision(
         main_case["flashinfer_sm120_fp8"]["median_ms"]
     )
     prefill_speedup = triton_main_ms / flashinfer_main_ms - 1.0
+
+    decode_graph_pairs: list[tuple[float, float]] = []
+    for case in decode_cases:
+        graph = case.get("cuda_graph")
+        try:
+            triton_graph_ms = float(graph["triton"]["median_ms"])
+            flashinfer_graph_ms = float(
+                graph["flashinfer_sm120_fp8"]["median_ms"]
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                "Stage 2 decision requires decode CUDA Graph latencies "
+                "for Triton and flashinfer_sm120_fp8"
+            ) from error
+        decode_graph_pairs.append((triton_graph_ms, flashinfer_graph_ms))
     decode_regression = max(
         0.0,
         *(
-            float(case["flashinfer_sm120_fp8"]["median_ms"])
-            / float(case["triton"]["median_ms"])
-            - 1.0
-            for case in decode_cases
+            flashinfer_ms / triton_ms - 1.0
+            for triton_ms, flashinfer_ms in decode_graph_pairs
         ),
     )
     correct = all(
@@ -202,6 +274,69 @@ def summarize_latencies(values_ms: Sequence[float]) -> dict[str, Any]:
     }
 
 
+def build_component_profile(detail_ms: dict[str, float]) -> dict[str, Any]:
+    keys = frozenset(detail_ms)
+    legacy_keys = (
+        COMMON_COMPONENT_DETAIL_KEYS | LEGACY_COMPONENT_EXTRA_KEYS
+    )
+    fused_keys = COMMON_COMPONENT_DETAIL_KEYS | FUSED_COMPONENT_EXTRA_KEYS
+    if keys == legacy_keys:
+        path = "legacy"
+        gemm2_input_prepare = sum(
+            detail_ms[key]
+            for key in ("silu", "quant2", "scale_pack_gemm2")
+        )
+    elif keys == fused_keys:
+        path = "fused"
+        gemm2_input_prepare = detail_ms[
+            "fused_swiglu_quant_pack_gemm2"
+        ]
+    else:
+        raise ValueError(
+            "component detail must match exactly one legacy/fused schema; "
+            f"got {sorted(keys)}"
+        )
+
+    rollup = {
+        "gemm1_input_prepare": sum(
+            detail_ms[key]
+            for key in ("quant1", "moe_permute", "scale_pack_gemm1")
+        ),
+        "gemm1": detail_ms["gemm1"],
+        "gemm2_input_prepare": gemm2_input_prepare,
+        "gemm2": detail_ms["gemm2"],
+        "unpermute_combine": detail_ms["unpermute_combine"],
+    }
+    return {
+        "path": path,
+        "detail_ms": dict(detail_ms),
+        "rollup_ms": rollup,
+    }
+
+
+def validate_component_trace(
+    trace: Sequence[str], call_counts: dict[str, int]
+) -> str:
+    normalized_trace = tuple(trace)
+    if normalized_trace == LEGACY_COMPONENT_TRACE:
+        path = "legacy"
+        expected_counts = LEGACY_COMPONENT_CALL_COUNTS
+    elif normalized_trace == FUSED_COMPONENT_TRACE:
+        path = "fused"
+        expected_counts = FUSED_COMPONENT_CALL_COUNTS
+    else:
+        raise ValueError(
+            "component call trace does not match legacy or fused runner: "
+            f"{list(normalized_trace)}"
+        )
+    if call_counts != expected_counts:
+        raise ValueError(
+            f"component call counts for {path} must be {expected_counts}, "
+            f"got {call_counts}"
+        )
+    return path
+
+
 def build_case_result(
     *,
     tokens: int,
@@ -210,14 +345,20 @@ def build_case_result(
     correctness: dict[str, Any],
     triton_trials: Sequence[float],
     flashinfer_trials: Sequence[float],
-    components_ms: dict[str, float],
+    component_profile: dict[str, Any],
+    cuda_graph_trials: dict[str, Sequence[float]] | None = None,
     cutlass_trials: Sequence[float] | None = None,
     cutlass_status: str = "CUTLASS_UNAVAILABLE",
 ) -> dict[str, Any]:
-    if set(components_ms) != set(COMPONENT_KEYS):
+    if set(component_profile) != {"path", "detail_ms", "rollup_ms"}:
         raise ValueError(
-            f"components_ms must contain exactly {sorted(COMPONENT_KEYS)}"
+            "component_profile must contain path, detail_ms, and rollup_ms"
         )
+    normalized_profile = build_component_profile(
+        component_profile["detail_ms"]
+    )
+    if normalized_profile != component_profile:
+        raise ValueError("component_profile is inconsistent with detail_ms")
     triton = summarize_latencies(triton_trials)
     flashinfer = summarize_latencies(flashinfer_trials)
     result = {
@@ -232,8 +373,26 @@ def build_case_result(
             triton["median_ms"] / flashinfer["median_ms"] - 1.0
         )
         * 100.0,
-        "components_ms": dict(components_ms),
+        "components": normalized_profile,
     }
+    is_decode = tokens in DECODE_TOKENS
+    if is_decode and cuda_graph_trials is None:
+        raise ValueError("decode CUDA Graph trials are required")
+    if not is_decode and cuda_graph_trials is not None:
+        raise ValueError("prefill cases must not contain CUDA Graph trials")
+    if cuda_graph_trials is None:
+        result["cuda_graph"] = {"status": "NOT_RUN"}
+    else:
+        expected_graph_backends = {"triton", "flashinfer_sm120_fp8"}
+        if set(cuda_graph_trials) != expected_graph_backends:
+            raise ValueError(
+                "cuda_graph_trials must contain exactly Triton and "
+                "flashinfer_sm120_fp8"
+            )
+        result["cuda_graph"] = {
+            name: summarize_latencies(values)
+            for name, values in cuda_graph_trials.items()
+        }
     result["cutlass"] = (
         summarize_latencies(cutlass_trials)
         if cutlass_trials is not None
@@ -261,7 +420,7 @@ def _git_snapshot() -> dict[str, Any]:
 
 def empty_result_payload(command: Sequence[str]) -> dict[str, Any]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "command": list(command),
         "git": {},
@@ -674,6 +833,37 @@ def time_backend(fn: Callable[[], Any], iterations: int) -> tuple[float, Any]:
     return start.elapsed_time(end) / iterations, retained
 
 
+def capture_backend_graph(fn: Callable[[], Any]) -> CapturedGraph:
+    import torch
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(2):
+            fn()
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = fn()
+    torch.cuda.synchronize()
+    return CapturedGraph(graph=graph, output=output)
+
+
+def time_graph_replay(state: CapturedGraph, iterations: int) -> float:
+    import torch
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    torch.cuda.synchronize()
+    start.record()
+    for _ in range(iterations):
+        state.graph.replay()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / iterations
+
+
 def trial_backend_order(
     trial: int, *, include_cutlass: bool
 ) -> tuple[str, ...]:
@@ -686,62 +876,90 @@ def trial_backend_order(
 
 def profile_flashinfer_components(
     case: RunnerCase, *, iterations: int
-) -> dict[str, float]:
+) -> dict[str, Any]:
     import torch
     from sglang.srt.layers.moe.moe_runner import (
         flashinfer_sm120_fp8 as flashinfer_runner,
     )
 
-    events: dict[str, list[tuple[Any, Any]]] = {
-        key: [] for key in COMPONENT_KEYS
+    events: dict[str, list[tuple[Any, Any]]] = {}
+    call_counts = {
+        "quant": 0,
+        "pack": 0,
+        "gemm": 0,
+        "moe_permute": 0,
+        "unpermute_combine": 0,
+        "silu": 0,
+        "fused": 0,
     }
-    counters = {"quant": 0, "pack": 0, "gemm": 0}
+    iteration_trace: list[str] = []
+    observed_path: str | None = None
 
-    def recorded(label: str, fn: Callable[..., Any]) -> Callable[..., Any]:
+    def recorded(
+        label: str, category: str, fn: Callable[..., Any]
+    ) -> Callable[..., Any]:
         def wrapper(*args: Any, **kwargs: Any) -> Any:
+            call_counts[category] += 1
+            iteration_trace.append(label)
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             start.record()
             result = fn(*args, **kwargs)
             end.record()
-            events[label].append((start, end))
+            events.setdefault(label, []).append((start, end))
             return result
 
         return wrapper
 
+    def sequential(
+        category: str,
+        labels: tuple[str, ...],
+        fn: Callable[..., Any],
+    ) -> Callable[..., Any]:
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            index = call_counts[category]
+            label = (
+                labels[index]
+                if index < len(labels)
+                else f"unexpected_{category}_{index + 1}"
+            )
+            return recorded(label, category, fn)(*args, **kwargs)
+
+        return wrapper
+
     def quant_wrapper(*args: Any, **kwargs: Any) -> Any:
-        label = (
-            "routing_quant_pack"
-            if counters["quant"] % 2 == 0
-            else "swiglu_quant"
-        )
-        counters["quant"] += 1
-        return recorded(
-            label,
+        return sequential(
+            "quant",
+            ("quant1", "quant2"),
             originals["quant"],
         )(*args, **kwargs)
 
     def pack_wrapper(*args: Any, **kwargs: Any) -> Any:
-        label = (
-            "routing_quant_pack"
-            if counters["pack"] % 2 == 0
-            else "scale_layout_gemm2"
-        )
-        counters["pack"] += 1
-        return recorded(
-            label,
+        return sequential(
+            "pack",
+            ("scale_pack_gemm1", "scale_pack_gemm2"),
             originals["pack"],
         )(*args, **kwargs)
 
     def gemm_wrapper(*args: Any, **kwargs: Any) -> Any:
-        label = "gemm1" if counters["gemm"] % 2 == 0 else "gemm2"
-        counters["gemm"] += 1
-        return recorded(label, originals["gemm"])(*args, **kwargs)
+        return sequential(
+            "gemm",
+            ("gemm1", "gemm2"),
+            originals["gemm"],
+        )(*args, **kwargs)
 
     originals = {
         "quant": flashinfer_runner.sglang_per_token_group_quant_fp8,
         "pack": flashinfer_runner.pack_flashinfer_sm120_fp8_scale,
         "gemm": flashinfer_runner._run_grouped_gemm,
+        "moe_permute": flashinfer_runner.moe_permute,
+        "unpermute_combine": flashinfer_runner.moe_unpermute,
+        "silu": getattr(flashinfer_runner, "silu_and_mul", None),
+        "fused": getattr(
+            flashinfer_runner,
+            "fused_swiglu_quant_pack_flashinfer_sm120_fp8",
+            None,
+        ),
     }
     with ExitStack() as stack:
         stack.enter_context(
@@ -755,7 +973,11 @@ def profile_flashinfer_components(
             patch.object(
                 flashinfer_runner,
                 "moe_permute",
-                recorded("routing_quant_pack", flashinfer_runner.moe_permute),
+                recorded(
+                    "moe_permute",
+                    "moe_permute",
+                    originals["moe_permute"],
+                ),
             )
         )
         stack.enter_context(
@@ -772,36 +994,71 @@ def profile_flashinfer_components(
                 gemm_wrapper,
             )
         )
-        stack.enter_context(
-            patch.object(
-                flashinfer_runner,
-                "silu_and_mul",
-                recorded("swiglu_quant", flashinfer_runner.silu_and_mul),
+        if originals["silu"] is not None:
+            stack.enter_context(
+                patch.object(
+                    flashinfer_runner,
+                    "silu_and_mul",
+                    recorded("silu", "silu", originals["silu"]),
+                )
             )
-        )
+        if originals["fused"] is not None:
+            stack.enter_context(
+                patch.object(
+                    flashinfer_runner,
+                    "fused_swiglu_quant_pack_flashinfer_sm120_fp8",
+                    recorded(
+                        "fused_swiglu_quant_pack_gemm2",
+                        "fused",
+                        originals["fused"],
+                    ),
+                )
+            )
         stack.enter_context(
             patch.object(
                 flashinfer_runner,
                 "moe_unpermute",
                 recorded(
-                    "unpermute_combine", flashinfer_runner.moe_unpermute
+                    "unpermute_combine",
+                    "unpermute_combine",
+                    originals["unpermute_combine"],
                 ),
             )
         )
         for _ in range(iterations):
+            iteration_trace.clear()
+            for category in call_counts:
+                call_counts[category] = 0
             flashinfer_runner.fused_experts_none_to_flashinfer_sm120_fp8(
                 case.dispatch,
                 case.quant_info,
                 case.config,
             )
+            iteration_path = validate_component_trace(
+                iteration_trace,
+                call_counts,
+            )
+            if observed_path is None:
+                observed_path = iteration_path
+            elif observed_path != iteration_path:
+                raise RuntimeError(
+                    "FlashInfer component path changed during profiling: "
+                    f"{observed_path} -> {iteration_path}"
+                )
     torch.cuda.synchronize()
 
-    del originals
-    return {
+    detail_ms = {
         label: sum(start.elapsed_time(end) for start, end in label_events)
         / iterations
         for label, label_events in events.items()
     }
+    profile = build_component_profile(detail_ms)
+    if profile["path"] != observed_path:
+        raise RuntimeError(
+            "component detail path does not match observed call trace: "
+            f"{profile['path']} != {observed_path}"
+        )
+    return profile
 
 
 def run_cuda_graph_check(case: RunnerCase) -> dict[str, Any]:
@@ -952,8 +1209,39 @@ def run_benchmark_case(
                     flush=True,
                 )
 
+        graph_latencies: dict[str, list[float]] | None = None
+        graph_states: dict[str, CapturedGraph] = {}
+        if case.tokens in DECODE_TOKENS:
+            graph_latencies = {
+                "triton": [],
+                "flashinfer_sm120_fp8": [],
+            }
+            for name in graph_latencies:
+                print(
+                    f"[graph capture] backend={name} tokens={case.tokens} "
+                    f"profile={case.profile}",
+                    flush=True,
+                )
+                graph_states[name] = capture_backend_graph(launchers[name])
+            for trial in range(trials):
+                for name in trial_backend_order(
+                    trial,
+                    include_cutlass=False,
+                ):
+                    latency = time_graph_replay(
+                        graph_states[name],
+                        iterations,
+                    )
+                    graph_latencies[name].append(latency)
+                    print(
+                        f"[graph trial {trial + 1}/{trials}] "
+                        f"backend={name} tokens={case.tokens} "
+                        f"profile={case.profile} latency_ms={latency:.6f}",
+                        flush=True,
+                    )
+
     component_iterations = min(iterations, 20)
-    components = profile_flashinfer_components(
+    component_profile = profile_flashinfer_components(
         case,
         iterations=component_iterations,
     )
@@ -964,7 +1252,8 @@ def run_benchmark_case(
         correctness=correctness,
         triton_trials=latencies["triton"],
         flashinfer_trials=latencies["flashinfer_sm120_fp8"],
-        components_ms=components,
+        component_profile=component_profile,
+        cuda_graph_trials=graph_latencies,
         cutlass_trials=latencies.get("cutlass"),
         cutlass_status=cutlass_status,
     )
@@ -973,7 +1262,7 @@ def run_benchmark_case(
         "CUDA kernel time inside the production FlashInfer runner; "
         "Python and allocator host time are excluded"
     )
-    del retained
+    del graph_states, retained
     return result
 
 
@@ -1017,6 +1306,15 @@ def _print_case_summary(result: dict[str, Any]) -> None:
         if "median_ms" in cutlass
         else cutlass["status"]
     )
+    graph = result["cuda_graph"]
+    graph_text = (
+        " triton_graph_ms="
+        f"{graph['triton']['median_ms']:.6f}"
+        " flashinfer_graph_ms="
+        f"{graph['flashinfer_sm120_fp8']['median_ms']:.6f}"
+        if graph.get("status") != "NOT_RUN"
+        else ""
+    )
     print(
         f"RESULT tokens={result['tokens']} routed_rows={result['routed_rows']} "
         f"profile={result['profile']} "
@@ -1025,7 +1323,8 @@ def _print_case_summary(result: dict[str, Any]) -> None:
         f"{result['flashinfer_sm120_fp8']['median_ms']:.6f} "
         f"cutlass={cutlass_text} "
         f"speedup={result['speedup_percent']:.2f}% "
-        f"correctness={result['correctness']['status']}",
+        f"correctness={result['correctness']['status']}"
+        f"{graph_text}",
         flush=True,
     )
 
