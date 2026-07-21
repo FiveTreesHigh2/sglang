@@ -168,3 +168,128 @@ def pack_flashinfer_sm120_fp8_scale(
             BLOCK_K=16,
         )
     return out
+
+
+def fused_swiglu_quant_pack_flashinfer_sm120_fp8(
+    gate_up: torch.Tensor,
+    topk_ids: torch.Tensor,
+    src2dst: torch.Tensor,
+    m_indptr: torch.Tensor,
+    *,
+    out: Optional[torch.Tensor] = None,
+    out_scale: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if gate_up.dtype != torch.bfloat16 or gate_up.ndim != 2:
+        raise TypeError("gate_up must be a 2D bfloat16 tensor")
+    if not gate_up.is_contiguous():
+        raise ValueError("gate_up must be contiguous")
+    if gate_up.shape[1] == 0 or gate_up.shape[1] % 256 != 0:
+        raise ValueError(
+            "gate_up last dimension must be positive and twice a multiple of 128"
+        )
+    if topk_ids.dtype != torch.int32 or topk_ids.ndim != 2:
+        raise TypeError("topk_ids must be a 2D int32 tensor")
+    if not topk_ids.is_contiguous():
+        raise ValueError("topk_ids must be contiguous")
+    if topk_ids.shape[1] == 0:
+        raise ValueError("topk_ids must have top_k > 0")
+
+    routes = topk_ids.numel()
+    if gate_up.shape[0] != routes:
+        raise ValueError(
+            f"gate_up rows must equal topk_ids.numel() ({routes}), "
+            f"got {gate_up.shape[0]}"
+        )
+    if (
+        src2dst.dtype != torch.int32
+        or src2dst.ndim != 1
+        or src2dst.numel() != routes
+    ):
+        raise TypeError(
+            "src2dst must be 1D int32 with one entry per routed slot"
+        )
+    if not src2dst.is_contiguous():
+        raise ValueError("src2dst must be contiguous")
+    if (
+        m_indptr.dtype != torch.int32
+        or m_indptr.ndim != 1
+        or m_indptr.numel() < 2
+    ):
+        raise TypeError(
+            "m_indptr must be contiguous int32 with shape [num_experts + 1]"
+        )
+    if not m_indptr.is_contiguous():
+        raise ValueError(
+            "m_indptr must be contiguous int32 with shape [num_experts + 1]"
+        )
+
+    tensors = (gate_up, topk_ids, src2dst, m_indptr)
+    if any(tensor.device.type != "cuda" for tensor in tensors):
+        raise ValueError("all fused SwiGLU quant-pack inputs must be CUDA tensors")
+    if any(tensor.device != gate_up.device for tensor in tensors[1:]):
+        raise ValueError(
+            "all fused SwiGLU quant-pack inputs must be on the same device"
+        )
+
+    hidden_dim = gate_up.shape[1] // 2
+    num_experts = m_indptr.numel() - 1
+    output_shape = (routes, hidden_dim)
+    scale_shape = (
+        hidden_dim // 128,
+        flashinfer_sm120_m_padded(routes, num_experts),
+    )
+
+    if out is None:
+        out = torch.empty(
+            output_shape,
+            device=gate_up.device,
+            dtype=torch.float8_e4m3fn,
+        )
+    if (
+        out.shape != output_shape
+        or out.dtype != torch.float8_e4m3fn
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "out must be contiguous float8_e4m3fn with shape "
+            f"{output_shape}, got dtype={out.dtype} shape={tuple(out.shape)}"
+        )
+    if out.device != gate_up.device:
+        raise ValueError("out and fused quant-pack inputs must be on the same device")
+
+    if out_scale is None:
+        out_scale = torch.empty(
+            scale_shape,
+            device=gate_up.device,
+            dtype=torch.float32,
+        )
+    if (
+        out_scale.shape != scale_shape
+        or out_scale.dtype != torch.float32
+        or not out_scale.is_contiguous()
+    ):
+        raise ValueError(
+            "out_scale must be contiguous float32 with shape "
+            f"{scale_shape}, got dtype={out_scale.dtype} "
+            f"shape={tuple(out_scale.shape)}"
+        )
+    if out_scale.device != gate_up.device:
+        raise ValueError(
+            "out_scale and fused quant-pack inputs must be on the same device"
+        )
+    if out_scale.data_ptr() % 16 != 0:
+        raise ValueError("FlashInfer A-scale output must be 16-byte aligned")
+
+    from sglang.jit_kernel.flashinfer_sm120_fp8_moe import (
+        flashinfer_sm120_fp8_silu_quant_pack,
+    )
+
+    flashinfer_sm120_fp8_silu_quant_pack(
+        gate_up,
+        out,
+        out_scale,
+        topk_ids,
+        src2dst,
+        m_indptr,
+    )
+    return out, out_scale
