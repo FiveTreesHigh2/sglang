@@ -114,6 +114,27 @@ def test_synthetic_skew_route_is_deterministic_skewed_and_unique() -> None:
     assert torch.count_nonzero(counts).item() == 256
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_route_generation_ignores_global_cuda_default_device() -> None:
+    utils = load_down_tuning_utils()
+
+    torch.set_default_device("cuda")
+    try:
+        routes = utils.generate_topk_ids(
+            64,
+            256,
+            8,
+            "uniform",
+            seed=3,
+            device="cpu",
+        )
+    finally:
+        torch.set_default_device("cpu")
+
+    assert routes.device.type == "cpu"
+    assert routes.shape == (64, 8)
+
+
 @pytest.mark.parametrize(
     ("num_tokens", "num_experts", "topk", "profile", "message"),
     [
