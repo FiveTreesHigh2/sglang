@@ -548,14 +548,41 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             else:
                 num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
                 num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
-            mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
-                projected_states_qkvz,
-                projected_states_ba,
-                num_k_heads_tp,
-                num_v_heads_tp,
-                self.head_k_dim,
-                self.head_v_dim,
+            qkv_dim = (
+                2 * num_k_heads_tp * self.head_k_dim
+                + num_v_heads_tp * self.head_v_dim
             )
+            if (
+                not _is_cpu
+                and forward_batch.forward_mode.is_extend()
+                and not forward_batch.forward_mode.is_target_verify()
+                and projected_states_qkvz.shape[-1]
+                == qkv_dim + num_v_heads_tp * self.head_v_dim
+            ):
+                # Prefill shortcut: the contiguous-layout fused kernel copies
+                # the leading qkv_dim columns verbatim, so a strided view
+                # replaces rewriting ~2/3 of the projection output.
+                # causal_conv1d_fn and fused_qkv_split_gdn_prefill accept the
+                # strided view; decode keeps the fused kernel (packed_decode
+                # expects contiguous input) and target_verify calls .view().
+                mixed_qkv = projected_states_qkvz[:, :qkv_dim]
+                z = projected_states_qkvz[:, qkv_dim:].unflatten(
+                    -1, (num_v_heads_tp, self.head_v_dim)
+                )
+                b, a = projected_states_ba.split(
+                    [num_v_heads_tp, num_v_heads_tp], dim=-1
+                )
+                b = b.contiguous()
+                a = a.contiguous()
+            else:
+                mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
+                    projected_states_qkvz,
+                    projected_states_ba,
+                    num_k_heads_tp,
+                    num_v_heads_tp,
+                    self.head_k_dim,
+                    self.head_v_dim,
+                )
         else:
             query, key, value, z, b, a = self.fix_query_key_value_ordering(
                 projected_states_qkvz, projected_states_ba

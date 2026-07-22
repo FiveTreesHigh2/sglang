@@ -440,7 +440,16 @@ def causal_conv1d_fn(
     if isinstance(activation, bool) and activation:
         activation = "silu"
 
-    out = torch.empty_like(x)
+    # empty_like on a non-dense strided view (e.g. the qkv columns of a wider
+    # projection output) falls back to row-major, which would de-coalesce the
+    # conv stores and every downstream read. Allocate a dense buffer matching
+    # the logical layout instead.
+    if (x.stride(0) == 1) & (x.stride(1) > 1):
+        out = torch.empty(
+            (x.shape[1], x.shape[0]), dtype=x.dtype, device=x.device
+        ).transpose(0, 1)
+    else:
+        out = torch.empty_like(x)
 
     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
     dim, cu_seqlen = x.shape
