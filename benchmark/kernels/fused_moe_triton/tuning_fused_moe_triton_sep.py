@@ -22,7 +22,11 @@ from common_utils import (
     get_model_config,
     sort_config,
 )
-from down_tuning_utils import ROUTE_PROFILES, validate_anchor_sizes
+from down_tuning_utils import (
+    ROUTE_PROFILES,
+    generate_topk_ids,
+    validate_anchor_sizes,
+)
 from ray.experimental.tqdm_ray import tqdm
 
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
@@ -126,6 +130,46 @@ def load_topk_ids(topk_ids_dir, i: int):
     return torch.load(
         f"{topk_ids_dir}/topk_ids_layer{i % moe_layers + dense_layers}_idx{i // moe_layers}.pt"
     )
+
+
+def build_topk_ids_list(
+    num_tokens: int,
+    num_experts: int,
+    topk: int,
+    topk_ids_dir: Optional[str],
+    route_profiles: Sequence[str],
+    route_seeds: Sequence[int],
+    num_samples: int,
+) -> Dict[str, List[torch.Tensor]]:
+    if num_samples <= 0:
+        raise ValueError(f"num_samples must be positive, got {num_samples}")
+    if topk_ids_dir is not None:
+        return {
+            "captured": [
+                load_topk_ids(topk_ids_dir, index)
+                for index in range(num_samples)
+            ]
+        }
+    if not route_profiles:
+        raise ValueError("route_profiles must not be empty")
+    if not route_seeds:
+        raise ValueError("route_seeds must not be empty")
+
+    workloads = {}
+    for profile in route_profiles:
+        for seed in route_seeds:
+            workload = f"{profile}/seed-{seed}"
+            workloads[workload] = [
+                generate_topk_ids(
+                    num_tokens,
+                    num_experts,
+                    topk,
+                    profile,
+                    seed=seed * 1_000_003 + sample_index,
+                )
+                for sample_index in range(num_samples)
+            ]
+    return workloads
 
 
 def benchmark_config(
