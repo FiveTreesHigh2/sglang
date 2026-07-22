@@ -490,3 +490,38 @@ def test_benchmark_config_routes_construction_and_timing_through_kernel_selectio
     assert "build_selected_kernel_wrappers(kernel, wrapper_factory)" in source
     assert "benchmark_kernel_wrappers(" in source
     assert "kernel0, kernel1 = get_kernel_wrapper" not in source
+
+
+def test_down_timing_records_name_tma_candidates_and_convert_us_to_ms() -> None:
+    sep = load_sep_tuner()
+    config = {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 16,
+        "num_warps": 8,
+        "num_stages": 4,
+    }
+
+    records = sep.down_timing_records(
+        config,
+        workload="uniform/seed-7",
+        timings_us={"down": 100.0, "down_tma": 80.0},
+    )
+
+    assert [record["use_tma"] for record in records] == [False, True]
+    assert [record["median_ms"] for record in records] == pytest.approx(
+        [0.1, 0.08]
+    )
+    assert all(record["profile"] == "uniform" for record in records)
+    assert all(record["seed"] == 7 for record in records)
+    assert records[0]["candidate"] != records[1]["candidate"]
+
+
+def test_down_candidate_worker_uses_generated_workloads_and_down_kernel() -> None:
+    sep = load_sep_tuner()
+
+    source = inspect.getsource(sep.BenchmarkWorker.benchmark_down_candidate)
+    assert "build_topk_ids_list(" in source
+    assert 'kernel="down"' in source
+    assert "down_timing_records(" in source
