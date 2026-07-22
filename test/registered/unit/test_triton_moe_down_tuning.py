@@ -525,3 +525,11 @@ def test_down_candidate_worker_uses_generated_workloads_and_down_kernel() -> Non
     assert "build_topk_ids_list(" in source
     assert 'kernel="down"' in source
     assert "down_timing_records(" in source
+
+
+def test_single_gpu_tuner_does_not_require_ray_at_module_import() -> None:
+    source = (TUNER_DIR / "tuning_fused_moe_triton_sep.py").read_text()
+    module_preamble = source.split("def main", maxsplit=1)[0]
+
+    assert "\nimport ray\n" not in module_preamble
+    assert "from tqdm import tqdm" in module_preamble

@@ -10,7 +10,6 @@ from contextlib import nullcontext
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-import ray
 import torch
 import triton
 import triton.language as tl
@@ -24,10 +23,11 @@ from common_utils import (
 )
 from down_tuning_utils import (
     ROUTE_PROFILES,
+    candidate_key,
     generate_topk_ids,
     validate_anchor_sizes,
 )
-from ray.experimental.tqdm_ray import tqdm
+from tqdm import tqdm
 
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
@@ -220,6 +220,36 @@ def build_topk_ids_list(
                 for sample_index in range(num_samples)
             ]
     return workloads
+
+
+def down_timing_records(
+    config: BenchmarkConfig,
+    workload: str,
+    timings_us: Dict[str, float],
+) -> List[Dict[str, Any]]:
+    if workload == "captured":
+        profile, seed = "captured", 0
+    else:
+        profile, separator, seed_text = workload.rpartition("/seed-")
+        if not separator or not profile:
+            raise ValueError(f"invalid route workload name: {workload!r}")
+        seed = int(seed_text)
+
+    records = []
+    for timing_name, use_tma in (("down", False), ("down_tma", True)):
+        if timing_name not in timings_us:
+            raise ValueError(f"missing timing {timing_name!r} for {workload}")
+        records.append(
+            {
+                "candidate": candidate_key(config, use_tma),
+                "config": dict(config),
+                "use_tma": use_tma,
+                "profile": profile,
+                "seed": seed,
+                "median_ms": float(timings_us[timing_name]) / 1000.0,
+            }
+        )
+    return records
 
 
 def benchmark_config(
@@ -559,6 +589,60 @@ class BenchmarkWorker:
             )
         return cfg, kernel_time
 
+    def benchmark_down_candidate(
+        self,
+        num_tokens: int,
+        num_experts: int,
+        shard_intermediate_size: int,
+        hidden_size: int,
+        topk: int,
+        dtype: torch.dtype,
+        use_fp8_w8a8: bool,
+        use_int8_w8a8: bool,
+        use_int8_w8a16: bool,
+        use_int4_w4a16: bool,
+        block_shape: List[int],
+        cfg: Dict[str, int],
+        topk_ids_dir: Optional[str],
+        route_profiles: Sequence[str],
+        route_seeds: Sequence[int],
+        ep_size: int = 1,
+        num_iters: int = 100,
+    ) -> List[Dict[str, Any]]:
+        torch.cuda.manual_seed_all(0)
+        workloads = build_topk_ids_list(
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            topk=topk,
+            topk_ids_dir=topk_ids_dir,
+            route_profiles=route_profiles,
+            route_seeds=route_seeds,
+            num_samples=num_iters,
+        )
+        records = []
+        with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
+            for workload, topk_ids_list in workloads.items():
+                timings = benchmark_config(
+                    cfg,
+                    num_tokens,
+                    num_experts,
+                    shard_intermediate_size,
+                    hidden_size,
+                    topk,
+                    dtype,
+                    use_fp8_w8a8,
+                    use_int8_w8a8,
+                    use_int8_w8a16,
+                    use_int4_w4a16,
+                    topk_ids_list,
+                    block_shape,
+                    ep_size=ep_size,
+                    num_iters=num_iters,
+                    kernel="down",
+                )
+                records.extend(down_timing_records(cfg, workload, timings))
+        return records
+
     def tune(
         self,
         num_tokens: int,
@@ -808,29 +892,68 @@ def main(args: argparse.Namespace):
                 "num_stages": args.configs[5],
             }
 
-            _, timings = worker.benchmark(
-                args.batch_size,
-                E,
-                shard_intermediate_size,
-                hidden_size,
-                topk,
-                dtype,
-                use_fp8_w8a8,
-                use_int8_w8a8,
-                use_int8_w8a16,
-                use_int4_w4a16,
-                block_shape,
-                cfg,
-                topk_ids_dir,
-                args.ep_size,
-            )
-            print(
-                f"t0={timings['up']}, t0_tma={timings['up_tma']}, "
-                f"t1={timings['down']}, t1_tma={timings['down_tma']}"
-            )
+            if args.kernel == "down":
+                records = worker.benchmark_down_candidate(
+                    args.batch_size,
+                    E,
+                    shard_intermediate_size,
+                    hidden_size,
+                    topk,
+                    dtype,
+                    use_fp8_w8a8,
+                    use_int8_w8a8,
+                    use_int8_w8a16,
+                    use_int4_w4a16,
+                    block_shape,
+                    cfg,
+                    topk_ids_dir,
+                    args.route_profiles,
+                    args.route_seeds,
+                    args.ep_size,
+                )
+                print(
+                    json.dumps(
+                        {
+                            "kernel": "down",
+                            "num_tokens": args.batch_size,
+                            "records": records,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+            else:
+                _, timings = worker.benchmark(
+                    args.batch_size,
+                    E,
+                    shard_intermediate_size,
+                    hidden_size,
+                    topk,
+                    dtype,
+                    use_fp8_w8a8,
+                    use_int8_w8a8,
+                    use_int8_w8a16,
+                    use_int4_w4a16,
+                    block_shape,
+                    cfg,
+                    topk_ids_dir,
+                    args.ep_size,
+                )
+                print(
+                    f"t0={timings['up']}, t0_tma={timings['up_tma']}, "
+                    f"t1={timings['down']}, t1_tma={timings['down_tma']}"
+                )
         return
 
     assert args.tune
+
+    try:
+        import ray
+    except ImportError as error:
+        raise RuntimeError(
+            "Ray is required only for the legacy multi-GPU tuning path. "
+            "Use --kernel down for the single-GPU staged tuner or install ray."
+        ) from error
 
     ray.init()
     num_gpus = int(ray.available_resources()["GPU"])
@@ -987,6 +1110,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
     if args.shortlist_size <= 0:
         parser.error("--shortlist-size must be positive")
+    if args.kernel == "down" and not args.tune and args.cmp_configs is None:
+        if args.batch_size is None:
+            parser.error("manual --kernel down benchmark requires --batch-size")
+        if args.configs is None or len(args.configs) != 6:
+            parser.error(
+                "manual --kernel down benchmark requires exactly six --configs "
+                "values: BLOCK_M BLOCK_N BLOCK_K GROUP_M warps stages"
+            )
     if args.kernel == "down" and args.tune:
         if args.batch_sizes is None:
             parser.error("--kernel down --tune requires --batch-sizes")
