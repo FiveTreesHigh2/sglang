@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import importlib.util
 import json
 import sys
@@ -43,6 +44,7 @@ def tuner_directory_on_path():
         sys.path.remove(str(TUNER_DIR))
 
 
+@functools.lru_cache(maxsize=1)
 def load_sep_tuner():
     path = TUNER_DIR / "tuning_fused_moe_triton_sep.py"
     spec = importlib.util.spec_from_file_location("tuning_fused_moe_triton_sep", path)
