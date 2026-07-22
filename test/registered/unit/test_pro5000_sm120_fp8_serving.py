@@ -325,10 +325,11 @@ def test_compare_rejects_token_count_mismatch_between_paired_cases(bench):
 @pytest.mark.parametrize("side", ("triton", "flashinfer"))
 def test_compare_rejects_unsupported_schema_on_either_manifest_side(bench, side):
     ratios = passing_ratios()
-    triton = manifest("triton", ratios)
-    flashinfer = manifest("flashinfer_sm120_fp8", ratios)
-    target = triton if side == "triton" else flashinfer
-    target["schema_version"] = 2
+    valid = manifest("triton", ratios)
+    invalid = {"schema_version": 2}
+    triton, flashinfer = (
+        (invalid, valid) if side == "triton" else (valid, invalid)
+    )
 
     with pytest.raises(ValueError, match="schema_version"):
         bench.compare_manifests(triton, flashinfer)
@@ -459,17 +460,34 @@ def test_capture_repeats_explicit_warmup_but_reuses_formal_results(
     args = capture_args(tmp_path)
     install_capture_environment(bench, monkeypatch, commands)
 
-    bench.run_capture(args)
-    bench.run_capture(args)
+    first = bench.run_capture(args)
+    second = bench.run_capture(args)
 
     warmups = [
         command
         for command in commands
         if command[command.index("--num-prompts") + 1] == "1"
     ]
-    formal_cases = [command for command in commands if command not in warmups]
+    formal_cases = [
+        command
+        for command in commands
+        if command[command.index("--num-prompts") + 1] == str(NUM_PROMPTS)
+    ]
     assert len(warmups) == 2
     assert len(formal_cases) == len(INPUT_LENGTHS) * len(SEEDS)
+    assert len(second["cases"]) == len(INPUT_LENGTHS) * len(SEEDS)
+    assert [case["run_key"] for case in second["cases"]] == [
+        case["run_key"] for case in first["cases"]
+    ]
+    result_fields = (
+        "input_throughput",
+        "median_ttft_ms",
+        "completed",
+        "total_input_tokens",
+    )
+    assert [
+        {field: case[field] for field in result_fields} for case in second["cases"]
+    ] == [{field: case[field] for field in result_fields} for case in first["cases"]]
 
 
 def test_capture_validates_flashinfer_marker_before_benchmark_or_manifest(
@@ -488,8 +506,6 @@ def test_capture_validates_flashinfer_marker_before_benchmark_or_manifest(
         "fetch_server_info",
         lambda host, port: server_info("flashinfer_sm120_fp8"),
     )
-    monkeypatch.setattr(bench, "git_commit", lambda repo: "d" * 40)
-    monkeypatch.setattr(bench, "query_single_gpu_uuid", lambda: "GPU-test")
     monkeypatch.setattr(
         bench.importlib.metadata,
         "version",
@@ -500,7 +516,7 @@ def test_capture_validates_flashinfer_marker_before_benchmark_or_manifest(
     )
     monkeypatch.setattr(bench.torch, "__version__", "2.11.0")
     monkeypatch.setattr(bench.torch.version, "cuda", "13.0")
-    run = Mock(side_effect=AssertionError("benchmark ran before A1 marker validation"))
+    run = Mock(side_effect=AssertionError("subprocess ran before A1 marker validation"))
     monkeypatch.setattr(bench.subprocess, "run", run)
 
     with pytest.raises(ValueError, match="server log missing A1 marker"):
