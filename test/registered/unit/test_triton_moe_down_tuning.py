@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import importlib.util
+import inspect
 import json
 import sys
 import tempfile
@@ -478,3 +479,14 @@ def test_wrapper_selection_preserves_up_and_legacy_both_modes(
     sep.build_selected_kernel_wrappers(kernel, factory)
 
     assert tuple(calls) == expected
+
+
+def test_benchmark_config_routes_construction_and_timing_through_kernel_selection() -> None:
+    sep = load_sep_tuner()
+
+    signature = inspect.signature(sep.benchmark_config)
+    assert signature.parameters["kernel"].default == "both"
+    source = inspect.getsource(sep.benchmark_config)
+    assert "build_selected_kernel_wrappers(kernel, wrapper_factory)" in source
+    assert "benchmark_kernel_wrappers(" in source
+    assert "kernel0, kernel1 = get_kernel_wrapper" not in source
