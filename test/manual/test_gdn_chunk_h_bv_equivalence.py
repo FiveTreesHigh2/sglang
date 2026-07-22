@@ -57,8 +57,14 @@ def _build_inputs(device):
 def _worker(out_path):
     import torch
 
-    from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
-    from sglang.kernels.ops.attention.fla.chunk_delta_h import GDN_CHUNK_H_BV
+    # The fla package lives at kernels.ops.attention in this repo but at
+    # srt.layers.attention in the venv-installed build on the serving host.
+    try:
+        from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
+        from sglang.kernels.ops.attention.fla.chunk_delta_h import GDN_CHUNK_H_BV
+    except ImportError:
+        from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
+        from sglang.srt.layers.attention.fla.chunk_delta_h import GDN_CHUNK_H_BV
 
     device = "cuda"
     q, k, v, g, beta, pool, indices, cu_seqlens = _build_inputs(device)
