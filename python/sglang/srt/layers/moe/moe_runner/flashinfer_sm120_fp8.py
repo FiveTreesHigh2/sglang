@@ -1,19 +1,23 @@
 from __future__ import annotations
 
 import functools
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.jit_kernel.moe_permute_prepare import moe_permute_prepare
 from sglang.kernels.ops.moe.ep_moe_kernels import moe_permute, moe_unpermute
 from sglang.kernels.ops.moe.flashinfer_sm120_fp8 import (
+    fused_quant_scatter_pack_flashinfer_sm120_fp8,
     fused_swiglu_quant_pack_flashinfer_sm120_fp8,
     pack_flashinfer_sm120_fp8_scale,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -25,6 +29,8 @@ if TYPE_CHECKING:
         StandardCombineInput,
         StandardDispatchOutput,
     )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -60,6 +66,16 @@ def _target_grouped_gemm():
             "flashinfer.grouped_mm.moe_gemm_fp8_nt_groupwise"
         ) from error
     return moe_gemm_fp8_nt_groupwise
+
+
+@functools.lru_cache(maxsize=1)
+def _use_fused_a1() -> bool:
+    enabled = envs.SGLANG_FLASHINFER_SM120_FP8_FUSED_A1.get()
+    logger.info(
+        "flashinfer_sm120_fp8 A1 prepare mode=%s",
+        "fused" if enabled else "legacy",
+    )
+    return enabled
 
 
 def _validate_contract(
@@ -246,19 +262,33 @@ def fused_experts_none_to_flashinfer_sm120_fp8(
     if topk_ids.numel() == 0:
         return StandardCombineInput(hidden_states=torch.empty_like(hidden_states))
 
-    q_hidden, q_scale = sglang_per_token_group_quant_fp8(hidden_states, 128)
-    packed_hidden, src2dst, m_indptr = moe_permute(
-        q_hidden,
-        topk_ids,
-        quant_info.w13_weight.shape[0],
-    )
-    a1_scale_fi = pack_flashinfer_sm120_fp8_scale(
-        q_scale,
-        topk_ids,
-        src2dst,
-        m_indptr,
-        source_is_packed=False,
-    )
+    if _use_fused_a1():
+        m_indptr, src2dst = moe_permute_prepare(
+            topk_ids=topk_ids,
+            num_experts=quant_info.w13_weight.shape[0],
+        )
+        packed_hidden, a1_scale_fi = (
+            fused_quant_scatter_pack_flashinfer_sm120_fp8(
+                hidden_states,
+                topk_ids,
+                src2dst,
+                m_indptr,
+            )
+        )
+    else:
+        q_hidden, q_scale = sglang_per_token_group_quant_fp8(hidden_states, 128)
+        packed_hidden, src2dst, m_indptr = moe_permute(
+            q_hidden,
+            topk_ids,
+            quant_info.w13_weight.shape[0],
+        )
+        a1_scale_fi = pack_flashinfer_sm120_fp8_scale(
+            q_scale,
+            topk_ids,
+            src2dst,
+            m_indptr,
+            source_is_packed=False,
+        )
 
     gate_up = torch.empty(
         packed_hidden.shape[0],
