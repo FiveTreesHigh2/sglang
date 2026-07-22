@@ -5,6 +5,7 @@ import argparse
 import dataclasses
 import json
 import os
+import statistics
 import time
 from contextlib import nullcontext
 from datetime import datetime
@@ -168,7 +169,7 @@ def benchmark_kernel_wrappers(
             samples[name].append(wrapper.forward_cost())
 
     return {
-        name: sum(costs) / num_iters * 1000
+        name: statistics.median(costs) / inner_iter * 1000
         for name, costs in samples.items()
     }
 
