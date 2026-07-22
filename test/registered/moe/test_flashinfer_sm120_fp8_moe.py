@@ -1197,7 +1197,109 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
         self.assertEqual(pack_scale.call_count, 1)
         self.assertEqual(silu.call_count, 0)
 
+    def test_full_runner_uses_fused_a1_only_when_enabled(self):
+        from sglang.srt.layers.moe.moe_runner import (
+            flashinfer_sm120_fp8 as runner,
+        )
+
+        topk_ids = (
+            torch.arange(16, device="cuda", dtype=torch.int32)
+            .remainder(16)
+            .view(8, 2)
+        )
+        dispatch, config, quant_info, _, _ = _make_runner_case(
+            8,
+            2,
+            topk_ids,
+        )
+
+        with patch.object(
+            runner,
+            "_use_fused_a1",
+            return_value=True,
+        ), patch.object(
+            runner,
+            "fused_quant_scatter_pack_flashinfer_sm120_fp8",
+            wraps=runner.fused_quant_scatter_pack_flashinfer_sm120_fp8,
+        ) as fused, patch.object(
+            runner,
+            "sglang_per_token_group_quant_fp8",
+            wraps=runner.sglang_per_token_group_quant_fp8,
+        ) as quant, patch.object(
+            runner,
+            "pack_flashinfer_sm120_fp8_scale",
+            wraps=runner.pack_flashinfer_sm120_fp8_scale,
+        ) as pack_scale, patch.object(
+            runner,
+            "moe_permute",
+            wraps=runner.moe_permute,
+        ) as permute, patch.object(
+            runner,
+            "moe_permute_prepare",
+            wraps=runner.moe_permute_prepare,
+        ) as prepare:
+            runner.fused_experts_none_to_flashinfer_sm120_fp8(
+                dispatch,
+                quant_info,
+                config,
+            )
+
+        self.assertEqual((fused.call_count, prepare.call_count), (1, 1))
+        self.assertEqual(
+            (
+                quant.call_count,
+                pack_scale.call_count,
+                permute.call_count,
+            ),
+            (0, 0, 0),
+        )
+
+        with patch.object(
+            runner,
+            "_use_fused_a1",
+            return_value=False,
+        ), patch.object(
+            runner,
+            "fused_quant_scatter_pack_flashinfer_sm120_fp8",
+            wraps=runner.fused_quant_scatter_pack_flashinfer_sm120_fp8,
+        ) as fused, patch.object(
+            runner,
+            "sglang_per_token_group_quant_fp8",
+            wraps=runner.sglang_per_token_group_quant_fp8,
+        ) as quant, patch.object(
+            runner,
+            "pack_flashinfer_sm120_fp8_scale",
+            wraps=runner.pack_flashinfer_sm120_fp8_scale,
+        ) as pack_scale, patch.object(
+            runner,
+            "moe_permute",
+            wraps=runner.moe_permute,
+        ) as permute, patch.object(
+            runner,
+            "moe_permute_prepare",
+            wraps=runner.moe_permute_prepare,
+        ) as prepare:
+            runner.fused_experts_none_to_flashinfer_sm120_fp8(
+                dispatch,
+                quant_info,
+                config,
+            )
+
+        self.assertEqual((fused.call_count, prepare.call_count), (0, 0))
+        self.assertEqual(
+            (
+                quant.call_count,
+                pack_scale.call_count,
+                permute.call_count,
+            ),
+            (1, 1, 1),
+        )
+
     def test_full_runner_correctness(self):
+        from sglang.srt.layers.moe.moe_runner import (
+            flashinfer_sm120_fp8 as flashinfer_runner,
+        )
+
         correctness_failures = []
         cases = [
             (1, 1, torch.tensor([[0]], device="cuda", dtype=torch.int32)),
@@ -1259,13 +1361,18 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
                 dispatch, config, quant_info, w13_scale, w2_scale = (
                     _make_runner_case(tokens, top_k, topk_ids)
                 )
-                actual, stage_diagnostics = (
-                    _run_flashinfer_with_stage_diagnostics(
-                        dispatch,
-                        config,
-                        quant_info,
+                with patch.object(
+                    flashinfer_runner,
+                    "_use_fused_a1",
+                    return_value=True,
+                ):
+                    actual, stage_diagnostics = (
+                        _run_flashinfer_with_stage_diagnostics(
+                            dispatch,
+                            config,
+                            quant_info,
+                        )
                     )
-                )
                 expected = _run_triton_reference(
                     dispatch,
                     config,
@@ -1305,13 +1412,24 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
         )
 
     def test_cuda_graph_replays_new_hidden_and_routing(self):
-        from sglang.srt.layers.moe.moe_runner.flashinfer_sm120_fp8 import (
-            fused_experts_none_to_flashinfer_sm120_fp8,
+        from sglang.srt.layers.moe.moe_runner import (
+            flashinfer_sm120_fp8 as flashinfer_runner,
         )
         from sglang.srt.layers.moe.token_dispatcher.standard import (
             StandardDispatchOutput,
         )
         from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+        fused_experts_none_to_flashinfer_sm120_fp8 = (
+            flashinfer_runner.fused_experts_none_to_flashinfer_sm120_fp8
+        )
+        fused_a1_patch = patch.object(
+            flashinfer_runner,
+            "_use_fused_a1",
+            return_value=True,
+        )
+        fused_a1_patch.start()
+        self.addCleanup(fused_a1_patch.stop)
 
         tokens, top_k = 8, 8
         route_a = (

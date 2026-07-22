@@ -208,3 +208,21 @@ def test_fp8_method_creates_flashinfer_sm120_runner():
         method.create_moe_runner(torch.nn.Module(), MoeRunnerConfig())
 
     assert method.runner.runner_backend is MoeRunnerBackend.FLASHINFER_SM120_FP8
+
+
+def test_fused_a1_env_defaults_off_and_reads_explicit_value(monkeypatch):
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.moe_runner import flashinfer_sm120_fp8 as runner
+
+    monkeypatch.delenv("SGLANG_FLASHINFER_SM120_FP8_FUSED_A1", raising=False)
+    use_fused_a1 = runner._use_fused_a1
+    use_fused_a1.cache_clear()
+    try:
+        assert envs.SGLANG_FLASHINFER_SM120_FP8_FUSED_A1.get() is False
+        assert use_fused_a1() is False
+
+        monkeypatch.setenv("SGLANG_FLASHINFER_SM120_FP8_FUSED_A1", "1")
+        use_fused_a1.cache_clear()
+        assert use_fused_a1() is True
+    finally:
+        use_fused_a1.cache_clear()
