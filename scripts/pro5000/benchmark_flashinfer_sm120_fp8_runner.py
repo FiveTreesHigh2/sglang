@@ -43,6 +43,16 @@ LEGACY_COMPONENT_EXTRA_KEYS = frozenset(
 FUSED_COMPONENT_EXTRA_KEYS = frozenset(
     ("fused_swiglu_quant_pack_gemm2",)
 )
+FUSED_A1_A2_COMPONENT_DETAIL_KEYS = frozenset(
+    (
+        "moe_permute_prepare",
+        "fused_quant_scatter_pack_gemm1",
+        "gemm1",
+        "fused_swiglu_quant_pack_gemm2",
+        "gemm2",
+        "unpermute_combine",
+    )
+)
 COMPONENT_ROLLUP_KEYS = (
     "gemm1_input_prepare",
     "gemm1",
@@ -61,7 +71,7 @@ LEGACY_COMPONENT_TRACE = (
     "gemm2",
     "unpermute_combine",
 )
-FUSED_COMPONENT_TRACE = (
+A1_LEGACY_A2_FUSED_COMPONENT_TRACE = (
     "quant1",
     "moe_permute",
     "scale_pack_gemm1",
@@ -70,23 +80,46 @@ FUSED_COMPONENT_TRACE = (
     "gemm2",
     "unpermute_combine",
 )
-LEGACY_COMPONENT_CALL_COUNTS = {
+A1_FUSED_A2_FUSED_COMPONENT_TRACE = (
+    "moe_permute_prepare",
+    "fused_quant_scatter_pack_gemm1",
+    "gemm1",
+    "fused_swiglu_quant_pack_gemm2",
+    "gemm2",
+    "unpermute_combine",
+)
+A1_LEGACY_A2_LEGACY_COMPONENT_CALL_COUNTS = {
     "quant": 2,
     "pack": 2,
     "gemm": 2,
     "moe_permute": 1,
-    "unpermute_combine": 1,
+    "prepare": 0,
+    "unpermute": 1,
     "silu": 1,
-    "fused": 0,
+    "fused_a1": 0,
+    "fused_a2": 0,
 }
-FUSED_COMPONENT_CALL_COUNTS = {
+A1_LEGACY_A2_FUSED_COMPONENT_CALL_COUNTS = {
     "quant": 1,
     "pack": 1,
     "gemm": 2,
     "moe_permute": 1,
-    "unpermute_combine": 1,
+    "prepare": 0,
+    "unpermute": 1,
     "silu": 0,
-    "fused": 1,
+    "fused_a1": 0,
+    "fused_a2": 1,
+}
+A1_FUSED_A2_FUSED_COMPONENT_CALL_COUNTS = {
+    "quant": 0,
+    "pack": 0,
+    "gemm": 2,
+    "moe_permute": 0,
+    "prepare": 1,
+    "unpermute": 1,
+    "silu": 0,
+    "fused_a1": 1,
+    "fused_a2": 1,
 }
 FULL_MEAN_ABS_REL_TOL = 5e-3
 FULL_SYMMETRIC_DIFF_TOL = 1e-4
@@ -281,13 +314,33 @@ def build_component_profile(detail_ms: dict[str, float]) -> dict[str, Any]:
     )
     fused_keys = COMMON_COMPONENT_DETAIL_KEYS | FUSED_COMPONENT_EXTRA_KEYS
     if keys == legacy_keys:
-        path = "legacy"
+        path = "a1_legacy_a2_legacy"
+        gemm1_input_prepare = sum(
+            detail_ms[key]
+            for key in ("quant1", "moe_permute", "scale_pack_gemm1")
+        )
         gemm2_input_prepare = sum(
             detail_ms[key]
             for key in ("silu", "quant2", "scale_pack_gemm2")
         )
     elif keys == fused_keys:
-        path = "fused"
+        path = "a1_legacy_a2_fused"
+        gemm1_input_prepare = sum(
+            detail_ms[key]
+            for key in ("quant1", "moe_permute", "scale_pack_gemm1")
+        )
+        gemm2_input_prepare = detail_ms[
+            "fused_swiglu_quant_pack_gemm2"
+        ]
+    elif keys == FUSED_A1_A2_COMPONENT_DETAIL_KEYS:
+        path = "a1_fused_a2_fused"
+        gemm1_input_prepare = sum(
+            detail_ms[key]
+            for key in (
+                "moe_permute_prepare",
+                "fused_quant_scatter_pack_gemm1",
+            )
+        )
         gemm2_input_prepare = detail_ms[
             "fused_swiglu_quant_pack_gemm2"
         ]
@@ -298,10 +351,7 @@ def build_component_profile(detail_ms: dict[str, float]) -> dict[str, Any]:
         )
 
     rollup = {
-        "gemm1_input_prepare": sum(
-            detail_ms[key]
-            for key in ("quant1", "moe_permute", "scale_pack_gemm1")
-        ),
+        "gemm1_input_prepare": gemm1_input_prepare,
         "gemm1": detail_ms["gemm1"],
         "gemm2_input_prepare": gemm2_input_prepare,
         "gemm2": detail_ms["gemm2"],
@@ -319,14 +369,17 @@ def validate_component_trace(
 ) -> str:
     normalized_trace = tuple(trace)
     if normalized_trace == LEGACY_COMPONENT_TRACE:
-        path = "legacy"
-        expected_counts = LEGACY_COMPONENT_CALL_COUNTS
-    elif normalized_trace == FUSED_COMPONENT_TRACE:
-        path = "fused"
-        expected_counts = FUSED_COMPONENT_CALL_COUNTS
+        path = "a1_legacy_a2_legacy"
+        expected_counts = A1_LEGACY_A2_LEGACY_COMPONENT_CALL_COUNTS
+    elif normalized_trace == A1_LEGACY_A2_FUSED_COMPONENT_TRACE:
+        path = "a1_legacy_a2_fused"
+        expected_counts = A1_LEGACY_A2_FUSED_COMPONENT_CALL_COUNTS
+    elif normalized_trace == A1_FUSED_A2_FUSED_COMPONENT_TRACE:
+        path = "a1_fused_a2_fused"
+        expected_counts = A1_FUSED_A2_FUSED_COMPONENT_CALL_COUNTS
     else:
         raise ValueError(
-            "component call trace does not match legacy or fused runner: "
+            "component call trace does not match a supported runner path: "
             f"{list(normalized_trace)}"
         )
     if call_counts != expected_counts:
@@ -888,9 +941,11 @@ def profile_flashinfer_components(
         "pack": 0,
         "gemm": 0,
         "moe_permute": 0,
-        "unpermute_combine": 0,
+        "prepare": 0,
+        "unpermute": 0,
         "silu": 0,
-        "fused": 0,
+        "fused_a1": 0,
+        "fused_a2": 0,
     }
     iteration_trace: list[str] = []
     observed_path: str | None = None
@@ -953,9 +1008,19 @@ def profile_flashinfer_components(
         "pack": flashinfer_runner.pack_flashinfer_sm120_fp8_scale,
         "gemm": flashinfer_runner._run_grouped_gemm,
         "moe_permute": flashinfer_runner.moe_permute,
+        "moe_permute_prepare": getattr(
+            flashinfer_runner,
+            "moe_permute_prepare",
+            None,
+        ),
         "unpermute_combine": flashinfer_runner.moe_unpermute,
         "silu": getattr(flashinfer_runner, "silu_and_mul", None),
-        "fused": getattr(
+        "fused_a1": getattr(
+            flashinfer_runner,
+            "fused_quant_scatter_pack_flashinfer_sm120_fp8",
+            None,
+        ),
+        "fused_a2": getattr(
             flashinfer_runner,
             "fused_swiglu_quant_pack_flashinfer_sm120_fp8",
             None,
@@ -980,6 +1045,18 @@ def profile_flashinfer_components(
                 ),
             )
         )
+        if originals["moe_permute_prepare"] is not None:
+            stack.enter_context(
+                patch.object(
+                    flashinfer_runner,
+                    "moe_permute_prepare",
+                    recorded(
+                        "moe_permute_prepare",
+                        "prepare",
+                        originals["moe_permute_prepare"],
+                    ),
+                )
+            )
         stack.enter_context(
             patch.object(
                 flashinfer_runner,
@@ -1002,15 +1079,27 @@ def profile_flashinfer_components(
                     recorded("silu", "silu", originals["silu"]),
                 )
             )
-        if originals["fused"] is not None:
+        if originals["fused_a1"] is not None:
+            stack.enter_context(
+                patch.object(
+                    flashinfer_runner,
+                    "fused_quant_scatter_pack_flashinfer_sm120_fp8",
+                    recorded(
+                        "fused_quant_scatter_pack_gemm1",
+                        "fused_a1",
+                        originals["fused_a1"],
+                    ),
+                )
+            )
+        if originals["fused_a2"] is not None:
             stack.enter_context(
                 patch.object(
                     flashinfer_runner,
                     "fused_swiglu_quant_pack_flashinfer_sm120_fp8",
                     recorded(
                         "fused_swiglu_quant_pack_gemm2",
-                        "fused",
-                        originals["fused"],
+                        "fused_a2",
+                        originals["fused_a2"],
                     ),
                 )
             )
@@ -1020,7 +1109,7 @@ def profile_flashinfer_components(
                 "moe_unpermute",
                 recorded(
                     "unpermute_combine",
-                    "unpermute_combine",
+                    "unpermute",
                     originals["unpermute_combine"],
                 ),
             )

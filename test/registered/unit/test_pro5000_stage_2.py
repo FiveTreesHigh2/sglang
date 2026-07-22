@@ -267,12 +267,22 @@ class TestPro5000Stage2(unittest.TestCase):
             "gemm2": 0.20,
             "unpermute_combine": 0.07,
         }
+        fully_fused_detail = {
+            "moe_permute_prepare": 0.02,
+            "fused_quant_scatter_pack_gemm1": 0.04,
+            "gemm1": 0.10,
+            "fused_swiglu_quant_pack_gemm2": 0.08,
+            "gemm2": 0.20,
+            "unpermute_combine": 0.07,
+        }
 
         legacy = bench.build_component_profile(legacy_detail)
         fused = bench.build_component_profile(fused_detail)
+        fully_fused = bench.build_component_profile(fully_fused_detail)
 
-        self.assertEqual(legacy["path"], "legacy")
-        self.assertEqual(fused["path"], "fused")
+        self.assertEqual(legacy["path"], "a1_legacy_a2_legacy")
+        self.assertEqual(fused["path"], "a1_legacy_a2_fused")
+        self.assertEqual(fully_fused["path"], "a1_fused_a2_fused")
         self.assertAlmostEqual(
             legacy["rollup_ms"]["gemm1_input_prepare"], 0.06
         )
@@ -282,8 +292,19 @@ class TestPro5000Stage2(unittest.TestCase):
         self.assertAlmostEqual(
             fused["rollup_ms"]["gemm2_input_prepare"], 0.08
         )
+        self.assertAlmostEqual(
+            fully_fused["rollup_ms"]["gemm1_input_prepare"], 0.06
+        )
+        self.assertAlmostEqual(
+            fully_fused["rollup_ms"]["gemm2_input_prepare"], 0.08
+        )
         self.assertEqual(
-            set(legacy["rollup_ms"]), set(fused["rollup_ms"])
+            set(legacy["rollup_ms"]),
+            set(fused["rollup_ms"]),
+        )
+        self.assertEqual(
+            set(legacy["rollup_ms"]),
+            set(fully_fused["rollup_ms"]),
         )
 
         missing_stage = dict(legacy_detail)
@@ -295,6 +316,11 @@ class TestPro5000Stage2(unittest.TestCase):
         mixed_paths["fused_swiglu_quant_pack_gemm2"] = 0.08
         with self.assertRaisesRegex(ValueError, "legacy/fused schema"):
             bench.build_component_profile(mixed_paths)
+
+        missing_fused_stage = dict(fully_fused_detail)
+        missing_fused_stage.pop("moe_permute_prepare")
+        with self.assertRaisesRegex(ValueError, "legacy/fused schema"):
+            bench.build_component_profile(missing_fused_stage)
 
     def test_component_trace_requires_exact_order_and_call_counts(self) -> None:
         bench = load_script("benchmark_flashinfer_sm120_fp8_runner.py")
@@ -314,9 +340,11 @@ class TestPro5000Stage2(unittest.TestCase):
             "pack": 2,
             "gemm": 2,
             "moe_permute": 1,
-            "unpermute_combine": 1,
+            "prepare": 0,
+            "unpermute": 1,
             "silu": 1,
-            "fused": 0,
+            "fused_a1": 0,
+            "fused_a2": 0,
         }
         fused_trace = [
             "quant1",
@@ -332,18 +360,46 @@ class TestPro5000Stage2(unittest.TestCase):
             "pack": 1,
             "gemm": 2,
             "moe_permute": 1,
-            "unpermute_combine": 1,
+            "prepare": 0,
+            "unpermute": 1,
             "silu": 0,
-            "fused": 1,
+            "fused_a1": 0,
+            "fused_a2": 1,
+        }
+        fully_fused_trace = [
+            "moe_permute_prepare",
+            "fused_quant_scatter_pack_gemm1",
+            "gemm1",
+            "fused_swiglu_quant_pack_gemm2",
+            "gemm2",
+            "unpermute_combine",
+        ]
+        fully_fused_counts = {
+            "quant": 0,
+            "pack": 0,
+            "gemm": 2,
+            "moe_permute": 0,
+            "prepare": 1,
+            "unpermute": 1,
+            "silu": 0,
+            "fused_a1": 1,
+            "fused_a2": 1,
         }
 
         self.assertEqual(
             bench.validate_component_trace(legacy_trace, legacy_counts),
-            "legacy",
+            "a1_legacy_a2_legacy",
         )
         self.assertEqual(
             bench.validate_component_trace(fused_trace, fused_counts),
-            "fused",
+            "a1_legacy_a2_fused",
+        )
+        self.assertEqual(
+            bench.validate_component_trace(
+                fully_fused_trace,
+                fully_fused_counts,
+            ),
+            "a1_fused_a2_fused",
         )
 
         with self.assertRaisesRegex(ValueError, "component call trace"):
@@ -360,6 +416,24 @@ class TestPro5000Stage2(unittest.TestCase):
             bench.validate_component_trace(
                 legacy_trace,
                 {**legacy_counts, "gemm": 3},
+            )
+        with self.assertRaisesRegex(ValueError, "component call trace"):
+            bench.validate_component_trace(
+                [
+                    *fully_fused_trace[:2],
+                    "fused_quant_scatter_pack_gemm1",
+                    *fully_fused_trace[2:],
+                ],
+                {**fully_fused_counts, "fused_a1": 2},
+            )
+        with self.assertRaisesRegex(ValueError, "component call trace"):
+            bench.validate_component_trace(
+                [
+                    fully_fused_trace[1],
+                    fully_fused_trace[0],
+                    *fully_fused_trace[2:],
+                ],
+                fully_fused_counts,
             )
 
     def test_cuda_graph_helpers_warm_capture_and_time_replay_only(self) -> None:
