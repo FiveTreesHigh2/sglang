@@ -479,6 +479,27 @@ def test_down_only_wrapper_selection_constructs_and_times_down_variants() -> Non
     assert all(wrapper.forward_calls == 3 for wrapper in wrappers.values())
 
 
+def test_wrapper_benchmark_reports_median_instead_of_mean() -> None:
+    sep = load_sep_tuner()
+
+    class VariableWrapper:
+        def __init__(self):
+            self.costs = iter((1.0, 9.0, 1.0))
+
+        def forward_cost(self) -> float:
+            return next(self.costs)
+
+    timings = sep.benchmark_kernel_wrappers(
+        {"down": VariableWrapper()},
+        prepare=lambda index, inner_iter: None,
+        num_iters=30,
+        inner_iter=10,
+        warmup=False,
+    )
+
+    assert timings == pytest.approx({"down": 100.0})
+
+
 @pytest.mark.parametrize(
     ("kernel", "expected"),
     [
