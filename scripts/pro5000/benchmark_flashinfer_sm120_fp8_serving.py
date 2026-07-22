@@ -137,6 +137,12 @@ def compare_manifests(
     triton: dict[str, Any], flashinfer: dict[str, Any]
 ) -> dict[str, Any]:
     """Compare fully paired captures, rejecting any config or case drift."""
+    for name, manifest in (("triton", triton), ("flashinfer", flashinfer)):
+        if manifest.get("schema_version") != 1:
+            raise ValueError(
+                f"{name} schema_version must be 1, got "
+                f"{manifest.get('schema_version')!r}"
+            )
     if triton["metadata"]["pairing_hash"] != flashinfer["metadata"][
         "pairing_hash"
     ]:
@@ -240,6 +246,13 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
 
 def run_capture(args: argparse.Namespace) -> dict[str, Any]:
     """Capture one warmup and every formal input-length/seed case."""
+    if args.expected_backend == "flashinfer_sm120_fp8":
+        marker = f"flashinfer_sm120_fp8 A1 prepare mode={args.a1_mode}"
+        if args.server_log is None or marker not in args.server_log.read_text(
+            errors="replace"
+        ):
+            raise ValueError(f"server log missing A1 marker: {marker}")
+
     info = fetch_server_info(args.host, args.port)
     snapshot = verify_server_info(info, args.expected_backend)
     commit = git_commit(args.repo)
@@ -297,6 +310,8 @@ def run_capture(args: argparse.Namespace) -> dict[str, Any]:
             "1",
             "--random-range-ratio",
             "1",
+            "--warmup-requests",
+            "0",
             "--num-prompts",
             str(num_prompts),
             "--output-file",
@@ -316,8 +331,7 @@ def run_capture(args: argparse.Namespace) -> dict[str, Any]:
     warmup_command = bench_command(
         input_length=4096, num_prompts=1, seed=0, output=warmup_output
     )
-    if not warmup_output.exists():
-        subprocess.run(warmup_command, check=True)
+    subprocess.run(warmup_command, check=True)
     warmup = parse_last_jsonl(warmup_output)
     if warmup["completed"] != 1:
         raise ValueError(f"warmup completed must be 1: {warmup}")
@@ -369,12 +383,6 @@ def run_capture(args: argparse.Namespace) -> dict[str, Any]:
                 {"schema_version": 1, "metadata": metadata, "cases": cases},
             )
 
-    if args.expected_backend == "flashinfer_sm120_fp8":
-        marker = f"flashinfer_sm120_fp8 A1 prepare mode={args.a1_mode}"
-        if args.server_log is None or marker not in args.server_log.read_text(
-            errors="replace"
-        ):
-            raise ValueError(f"server log missing A1 marker: {marker}")
     return {"schema_version": 1, "metadata": metadata, "cases": cases}
 
 
@@ -435,6 +443,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     reference = json.loads(args.triton.read_text())
     candidate = json.loads(args.flashinfer.read_text())
+    for name, manifest in (("reference", reference), ("candidate", candidate)):
+        if manifest.get("schema_version") != 1:
+            raise ValueError(
+                f"{name} schema_version must be 1, got "
+                f"{manifest.get('schema_version')!r}"
+            )
     expected_reference = args.allow_reference_backend or "triton"
     if reference["metadata"]["moe_backend"] != expected_reference:
         raise ValueError(
