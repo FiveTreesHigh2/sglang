@@ -575,3 +575,137 @@ def test_single_gpu_tuner_does_not_require_ray_at_module_import() -> None:
 
     assert "\nimport ray\n" not in module_preamble
     assert "from tqdm import tqdm" in module_preamble
+
+
+def test_profile_shortlist_keeps_each_workload_winner() -> None:
+    utils = load_down_tuning_utils()
+    records = [
+        {"candidate": "uniform-best", "profile": "uniform", "seed": 0, "median_ms": 1.0},
+        {"candidate": "uniform-best", "profile": "synthetic-skew", "seed": 0, "median_ms": 2.0},
+        {"candidate": "skew-best", "profile": "uniform", "seed": 0, "median_ms": 1.5},
+        {"candidate": "skew-best", "profile": "synthetic-skew", "seed": 0, "median_ms": 0.9},
+    ]
+
+    assert utils.shortlist_candidate_keys(records, per_workload=1) == (
+        "skew-best",
+        "uniform-best",
+    )
+
+
+def test_staged_search_runs_full_space_then_reuses_shortlist_for_anchors() -> None:
+    sep = load_sep_tuner()
+    utils = load_down_tuning_utils()
+    config_a = {
+        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+    }
+    config_b = {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 16,
+        "num_warps": 8,
+        "num_stages": 4,
+    }
+    default_config = {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 32,
+        "num_warps": 4,
+        "num_stages": 3,
+    }
+    calls = []
+
+    def benchmark(
+        num_tokens,
+        config,
+        profiles,
+        seeds,
+        num_iters,
+        phase,
+    ):
+        calls.append(
+            (
+                phase,
+                num_tokens,
+                config["BLOCK_SIZE_M"],
+                tuple(profiles),
+                tuple(seeds),
+                num_iters,
+            )
+        )
+        records = []
+        for profile in profiles:
+            for seed in seeds:
+                if profile == "uniform":
+                    base = 1.0 if config == config_a else 1.2
+                else:
+                    base = 0.9 if config == config_b else 1.3
+                for use_tma, factor in ((False, 1.0), (True, 0.95)):
+                    records.append(
+                        {
+                            "candidate": utils.candidate_key(config, use_tma),
+                            "config": dict(config),
+                            "use_tma": use_tma,
+                            "profile": profile,
+                            "seed": seed,
+                            "median_ms": base * factor,
+                        }
+                    )
+        return records
+
+    result = sep.run_staged_down_search(
+        batch_sizes=[1, 8192],
+        full_search_size=8192,
+        search_space=[config_a, config_b],
+        default_configs={1: default_config, 8192: default_config},
+        route_profiles=["uniform", "synthetic-skew"],
+        route_seeds=[0, 1],
+        shortlist_size=1,
+        coarse_iters=20,
+        stable_iters=100,
+        benchmark=benchmark,
+    )
+
+    assert set(result["configs"]) == {"1", "8192"}
+    assert all("USE_TMA" in config for config in result["configs"].values())
+    assert len(result["raw_timings"]["coarse"]) == 8
+    assert any(call[0] == "stable-full" for call in calls)
+    anchor_calls = [call for call in calls if call[0] == "stable-anchor"]
+    assert anchor_calls
+    assert all(call[1] == 1 for call in anchor_calls)
+    assert all(call[3] == ("uniform", "synthetic-skew") for call in calls)
+    assert all(call[4] == (0,) for call in calls if call[0] == "coarse")
+    assert all(call[4] == (0, 1) for call in calls if call[0] != "coarse")
+
+
+def test_cli_accepts_staged_search_runtime_controls() -> None:
+    sep = load_sep_tuner()
+
+    args = sep.parse_args(
+        [
+            "--kernel",
+            "down",
+            "--tune",
+            "--batch-sizes",
+            "1",
+            "8192",
+            "--output",
+            "/tmp/down.json",
+            "--coarse-iters",
+            "20",
+            "--stable-iters",
+            "100",
+            "--max-configs",
+            "8",
+        ]
+    )
+
+    assert args.coarse_iters == 20
+    assert args.stable_iters == 100
+    assert args.max_configs == 8
