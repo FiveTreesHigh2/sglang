@@ -238,7 +238,8 @@ def benchmark_config(
     block_shape: List[int] = None,
     ep_size: int = 1,
     num_iters: int = 100,
-) -> float:
+    kernel: str = "both",
+) -> Dict[str, float]:
     ncu_enable = os.getenv("NCU_ENABLE", "0") == "1"
     if ncu_enable:
         num_iters = 1
@@ -407,26 +408,19 @@ def benchmark_config(
             moe_inputs[k].expert_ids.copy_(expert_ids_)
             moe_inputs[k].num_tokens_post_padded.copy_(num_tokens_post_padded_)
 
-    def get_kernel_wrapper(moe_use_tma, inner_iter, use_cuda_graph):
-        compute_type = (
-            tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
-        )
-        moe_runner_config = MoeRunnerConfig(
-            inplace=True,
-        )
-        apply_router_weight_on_input = moe_runner_config.apply_router_weight_on_input
-        kernel0 = KernelWrapper(
-            A=hidden_states,
-            B=w1,
+    compute_type = (
+        tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
+    )
+    moe_runner_config = MoeRunnerConfig(inplace=True)
+    apply_router_weight_on_input = moe_runner_config.apply_router_weight_on_input
+    use_cuda_graph = not ncu_enable
+
+    def wrapper_factory(operation: str, moe_use_tma: bool) -> KernelWrapper:
+        common = dict(
             bias=None,
-            C=intermediate_cache1,
-            A_scale=a1_scale,
-            B_scale=w1_scale,
             B_zp=None,
             topk_weights=topk_output_.topk_weights,
             moe_inputs=moe_inputs,
-            mul_routed_weight=apply_router_weight_on_input,
-            top_k=topk,
             config=config,
             compute_type=compute_type,
             use_fp8_w8a8=use_fp8_w8a8,
@@ -435,71 +429,48 @@ def benchmark_config(
             use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=False,
             block_shape=block_shape,
-            b_use_tma=moe_use_tma,
-            c_sorted=moe_use_tma,
             filter_expert=False,
             use_cuda_graph=use_cuda_graph,
             inner_iter=inner_iter,
         )
-        kernel1 = KernelWrapper(
-            A=intermediate_cache2,
-            B=w2,
-            bias=None,
-            C=intermediate_cache3,
-            A_scale=a2_scale,
-            B_scale=w2_scale,
-            B_zp=None,
-            topk_weights=topk_output_.topk_weights,
-            moe_inputs=moe_inputs,
-            mul_routed_weight=not apply_router_weight_on_input,
-            top_k=1,
-            config=config,
-            compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            use_int4_w4a16=use_int4_w4a16,
-            per_channel_quant=False,
-            block_shape=block_shape,
-            a_use_tma=moe_use_tma,
-            b_use_tma=moe_use_tma,
-            filter_expert=False,
-            use_cuda_graph=use_cuda_graph,
-            inner_iter=inner_iter,
-        )
-        return kernel0, kernel1
+        if operation == "up":
+            return KernelWrapper(
+                A=hidden_states,
+                B=w1,
+                C=intermediate_cache1,
+                A_scale=a1_scale,
+                B_scale=w1_scale,
+                mul_routed_weight=apply_router_weight_on_input,
+                top_k=topk,
+                b_use_tma=moe_use_tma,
+                c_sorted=moe_use_tma,
+                **common,
+            )
+        if operation == "down":
+            return KernelWrapper(
+                A=intermediate_cache2,
+                B=w2,
+                C=intermediate_cache3,
+                A_scale=a2_scale,
+                B_scale=w2_scale,
+                mul_routed_weight=not apply_router_weight_on_input,
+                top_k=1,
+                a_use_tma=moe_use_tma,
+                b_use_tma=moe_use_tma,
+                **common,
+            )
+        raise ValueError(f"unsupported operation: {operation!r}")
 
-    use_cuda_graph = True if not ncu_enable else False
-
-    kernel0, kernel1 = get_kernel_wrapper(False, inner_iter, use_cuda_graph)
-    kernel_tma0, kernel_tma1 = get_kernel_wrapper(True, inner_iter, use_cuda_graph)
-
-    # JIT compilation & warmup
-    if not ncu_enable:
-        kernel0.forward_cost()
-        kernel1.forward_cost()
-        kernel_tma0.forward_cost()
-        kernel_tma1.forward_cost()
-
-    ts0 = []
-    ts1 = []
-    ts_tma0 = []
-    ts_tma1 = []
-
-    for i in range(num_iters // inner_iter):
-        prepare(i, inner_iter)
-        ts0.append(kernel0.forward_cost())
-        ts1.append(kernel1.forward_cost())
-        ts_tma0.append(kernel_tma0.forward_cost())
-        ts_tma1.append(kernel_tma1.forward_cost())
+    wrappers = build_selected_kernel_wrappers(kernel, wrapper_factory)
+    timings = benchmark_kernel_wrappers(
+        wrappers,
+        prepare,
+        num_iters=num_iters,
+        inner_iter=inner_iter,
+        warmup=not ncu_enable,
+    )
     torch.cuda.synchronize()
-
-    avg = sum(ts0) / (num_iters) * 1000  # us
-    avg1 = sum(ts1) / (num_iters) * 1000  # us
-    avg_tma = sum(ts_tma0) / (num_iters) * 1000  # us
-    avg1_tma = sum(ts_tma1) / (num_iters) * 1000  # us
-
-    return avg, avg_tma, avg1, avg1_tma
+    return timings
 
 
 class BestConfigTrace:
@@ -566,7 +537,7 @@ class BenchmarkWorker:
         cfg: Dict[str, int],
         topk_ids_dir: str,
         ep_size: int = 1,
-    ) -> Tuple[Dict[str, int], float]:
+    ) -> Tuple[Dict[str, int], Dict[str, float]]:
         torch.cuda.manual_seed_all(0)
         topk_ids_list = [load_topk_ids(topk_ids_dir, i) for i in range(100)]
         with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
@@ -612,7 +583,7 @@ class BenchmarkWorker:
         with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
             for config in tqdm(search_space):
                 try:
-                    kt0_no_tma, kt0_tma, kt1_no_tma, kt1_tma = benchmark_config(
+                    timings = benchmark_config(
                         config,
                         num_tokens,
                         num_experts,
@@ -632,14 +603,14 @@ class BenchmarkWorker:
                 except triton.runtime.autotuner.OutOfResources:
                     # Some configurations may be invalid and fail to compile.
                     continue
-                trace0.update(
-                    config,
-                    (kt0_no_tma, kt0_tma, kt1_no_tma, kt1_tma),
+                timing_tuple = (
+                    timings["up"],
+                    timings["up_tma"],
+                    timings["down"],
+                    timings["down_tma"],
                 )
-                trace1.update(
-                    config,
-                    (kt0_no_tma, kt0_tma, kt1_no_tma, kt1_tma),
-                )
+                trace0.update(config, timing_tuple)
+                trace1.update(config, timing_tuple)
 
         now = datetime.now()
         print(f"{now.ctime()}] Completed tuning for batch_size={num_tokens}")
@@ -837,7 +808,7 @@ def main(args: argparse.Namespace):
                 "num_stages": args.configs[5],
             }
 
-            _, (t0, t0_tma, t1, t1_tma) = worker.benchmark(
+            _, timings = worker.benchmark(
                 args.batch_size,
                 E,
                 shard_intermediate_size,
@@ -853,7 +824,10 @@ def main(args: argparse.Namespace):
                 topk_ids_dir,
                 args.ep_size,
             )
-            print(f"{t0=}, {t0_tma=}, {t1=}, {t1_tma=}")
+            print(
+                f"t0={timings['up']}, t0_tma={timings['up_tma']}, "
+                f"t1={timings['down']}, t1_tma={timings['down_tma']}"
+            )
         return
 
     assert args.tune
