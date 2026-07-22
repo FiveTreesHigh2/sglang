@@ -339,3 +339,76 @@ def test_cli_rejects_incomplete_down_tuning_contract(argv: list[str]) -> None:
 
     with pytest.raises(SystemExit):
         sep.parse_args(argv)
+
+
+def test_synthetic_route_source_builds_reproducible_profile_seed_workloads() -> None:
+    sep = load_sep_tuner()
+
+    first = sep.build_topk_ids_list(
+        num_tokens=64,
+        num_experts=256,
+        topk=8,
+        topk_ids_dir=None,
+        route_profiles=["uniform", "synthetic-skew"],
+        route_seeds=[0, 1],
+        num_samples=3,
+    )
+    second = sep.build_topk_ids_list(
+        num_tokens=64,
+        num_experts=256,
+        topk=8,
+        topk_ids_dir=None,
+        route_profiles=["uniform", "synthetic-skew"],
+        route_seeds=[0, 1],
+        num_samples=3,
+    )
+
+    assert tuple(first) == (
+        "uniform/seed-0",
+        "uniform/seed-1",
+        "synthetic-skew/seed-0",
+        "synthetic-skew/seed-1",
+    )
+    for workload, samples in first.items():
+        assert len(samples) == 3
+        assert all(sample.shape == (64, 8) for sample in samples)
+        assert all(sample.dtype == torch.int32 for sample in samples)
+        assert all(
+            torch.equal(left, right)
+            for left, right in zip(samples, second[workload])
+        )
+    assert not torch.equal(
+        first["uniform/seed-0"][0],
+        first["uniform/seed-1"][0],
+    )
+
+
+def test_captured_route_source_preserves_legacy_loader(monkeypatch) -> None:
+    sep = load_sep_tuner()
+    captured = [
+        torch.full((64, 8), index, dtype=torch.int32)
+        for index in range(3)
+    ]
+    calls = []
+
+    def fake_load(directory: str, index: int) -> torch.Tensor:
+        calls.append((directory, index))
+        return captured[index]
+
+    monkeypatch.setattr(sep, "load_topk_ids", fake_load)
+    sources = sep.build_topk_ids_list(
+        num_tokens=64,
+        num_experts=256,
+        topk=8,
+        topk_ids_dir="/routes",
+        route_profiles=["uniform"],
+        route_seeds=[0],
+        num_samples=3,
+    )
+
+    assert tuple(sources) == ("captured",)
+    assert all(
+        actual is expected
+        for actual, expected in zip(sources["captured"], captured)
+    )
+    assert calls == [("/routes", 0), ("/routes", 1), ("/routes", 2)]
