@@ -1,11 +1,143 @@
 from __future__ import annotations
 
-from typing import Union
+import json
+import math
+import os
+import statistics
+import tempfile
+from collections import defaultdict
+from pathlib import Path
+from typing import Any, Dict, Mapping, Sequence, Tuple, Union
 
 import torch
 
 
 ROUTE_PROFILES = ("uniform", "synthetic-skew")
+
+
+def candidate_key(config: Mapping[str, Any], use_tma: bool) -> str:
+    normalized = {
+        key: value for key, value in config.items() if key != "USE_TMA"
+    }
+    return json.dumps(
+        {"config": normalized, "use_tma": bool(use_tma)},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def select_robust_candidate(
+    records: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    if not records:
+        raise ValueError("records must not be empty")
+
+    samples = defaultdict(lambda: defaultdict(list))
+    all_workloads = set()
+    for record in records:
+        candidate = str(record["candidate"])
+        workload = (str(record["profile"]), int(record["seed"]))
+        latency = float(record["median_ms"])
+        if not math.isfinite(latency) or latency <= 0:
+            raise ValueError(
+                f"median_ms must be finite and positive, got {latency}"
+            )
+        samples[candidate][workload].append(latency)
+        all_workloads.add(workload)
+
+    complete = {
+        candidate: {
+            workload: statistics.median(latencies)
+            for workload, latencies in workloads.items()
+        }
+        for candidate, workloads in samples.items()
+        if set(workloads) == all_workloads
+    }
+    if not complete:
+        raise ValueError(
+            "no candidate has complete coverage of every profile and seed"
+        )
+
+    workload_best = {
+        workload: min(latencies[workload] for latencies in complete.values())
+        for workload in all_workloads
+    }
+    ranked = []
+    for candidate, latencies in complete.items():
+        regrets = [
+            latencies[workload] / workload_best[workload] - 1.0
+            for workload in sorted(all_workloads)
+        ]
+        values = list(latencies.values())
+        ranked.append(
+            (
+                max(regrets),
+                statistics.median(regrets),
+                statistics.median(values),
+                candidate,
+                regrets,
+                latencies,
+            )
+        )
+
+    (
+        max_regret,
+        median_regret,
+        median_latency,
+        selected,
+        regrets,
+        latencies,
+    ) = min(ranked, key=lambda item: item[:4])
+    return {
+        "candidate": selected,
+        "max_regret": max_regret,
+        "median_regret": median_regret,
+        "median_ms": median_latency,
+        "workload_count": len(all_workloads),
+        "regrets": regrets,
+        "latencies_ms": {
+            f"{profile}/seed-{seed}": latency
+            for (profile, seed), latency in sorted(latencies.items())
+        },
+    }
+
+
+def validate_anchor_sizes(
+    batch_sizes: Sequence[int], full_search_size: int
+) -> Tuple[int, ...]:
+    if full_search_size <= 0:
+        raise ValueError(
+            f"full search size must be positive, got {full_search_size}"
+        )
+    normalized = tuple(sorted({int(size) for size in batch_sizes}))
+    if not normalized or normalized[0] <= 0:
+        raise ValueError("batch sizes must be positive")
+    if full_search_size not in normalized:
+        raise ValueError(
+            f"full search size {full_search_size} must be present in batch sizes"
+        )
+    return normalized
+
+
+def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        text=True,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w") as output:
+            json.dump(payload, output, indent=2, sort_keys=True)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        temporary_path.replace(path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _validate_route_contract(
