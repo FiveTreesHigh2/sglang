@@ -432,6 +432,421 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
         )
         torch.testing.assert_close(out, expected)
 
+    def _assert_fused_a1_matches_legacy(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        experts: int,
+    ):
+        from sglang.kernels.ops.moe.flashinfer_sm120_fp8 import (
+            flashinfer_sm120_m_padded,
+            fused_quant_scatter_pack_flashinfer_sm120_fp8,
+            pack_flashinfer_sm120_fp8_scale,
+        )
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+
+        ref_q, ref_scale = sglang_per_token_group_quant_fp8(
+            hidden_states,
+            128,
+        )
+        ref_packed, src2dst, m_indptr = moe_permute(
+            ref_q,
+            topk_ids,
+            experts,
+        )
+        ref_scale_fi = pack_flashinfer_sm120_fp8_scale(
+            ref_scale,
+            topk_ids,
+            src2dst,
+            m_indptr,
+            source_is_packed=False,
+        )
+
+        actual_q, actual_scale = (
+            fused_quant_scatter_pack_flashinfer_sm120_fp8(
+                hidden_states,
+                topk_ids,
+                src2dst,
+                m_indptr,
+            )
+        )
+        torch.testing.assert_close(
+            actual_q.view(torch.uint8),
+            ref_packed.view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            actual_scale,
+            ref_scale_fi,
+            rtol=0,
+            atol=0,
+        )
+        self.assertEqual(
+            actual_q.shape,
+            (topk_ids.numel(), hidden_states.shape[1]),
+        )
+        self.assertEqual(actual_q.dtype, torch.float8_e4m3fn)
+        self.assertTrue(actual_q.is_contiguous())
+        self.assertEqual(
+            actual_scale.shape,
+            (
+                hidden_states.shape[1] // 128,
+                flashinfer_sm120_m_padded(topk_ids.numel(), experts),
+            ),
+        )
+        self.assertEqual(actual_scale.dtype, torch.float32)
+        self.assertTrue(actual_scale.is_contiguous())
+        self.assertEqual(actual_scale.data_ptr() % 16, 0)
+
+    def test_fused_a1_matches_actual_legacy_v2_reference(self):
+        from sglang.kernels.ops.moe.flashinfer_sm120_fp8 import (
+            pack_flashinfer_sm120_fp8_scale,
+        )
+        from sglang.kernels.ops.quantization import fp8_kernel
+
+        torch.manual_seed(101)
+        tokens, hidden, experts = 8, 512, 8
+        topk_ids = torch.tensor(
+            [
+                [3, 3],
+                [0, 7],
+                [1, 1],
+                [6, 2],
+                [7, 7],
+                [4, 0],
+                [5, 6],
+                [2, 3],
+            ],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        hidden_states = torch.randn(
+            (tokens, hidden),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+
+        with patch.object(
+            fp8_kernel,
+            "sgl_per_token_group_quant_8bit_jit_v2",
+            wraps=fp8_kernel.sgl_per_token_group_quant_8bit_jit_v2,
+        ) as v2:
+            ref_q, ref_scale = fp8_kernel.sglang_per_token_group_quant_fp8(
+                hidden_states,
+                128,
+            )
+        self.assertEqual(v2.call_count, 1)
+
+        ref_packed, src2dst, m_indptr = moe_permute(
+            ref_q,
+            topk_ids,
+            experts,
+        )
+        ref_scale_fi = pack_flashinfer_sm120_fp8_scale(
+            ref_scale,
+            topk_ids,
+            src2dst,
+            m_indptr,
+            source_is_packed=False,
+        )
+
+        from sglang.kernels.ops.moe.flashinfer_sm120_fp8 import (
+            fused_quant_scatter_pack_flashinfer_sm120_fp8,
+        )
+
+        actual_q, actual_scale = (
+            fused_quant_scatter_pack_flashinfer_sm120_fp8(
+                hidden_states,
+                topk_ids,
+                src2dst,
+                m_indptr,
+            )
+        )
+        torch.testing.assert_close(
+            actual_q.view(torch.uint8),
+            ref_packed.view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            actual_scale,
+            ref_scale_fi,
+            rtol=0,
+            atol=0,
+        )
+
+    def test_fused_a1_route_profiles(self):
+        torch.manual_seed(102)
+        experts = 8
+        profiles = (
+            torch.tensor(
+                [[0], [1], [2], [3]],
+                device="cuda",
+                dtype=torch.int32,
+            ),
+            torch.tensor(
+                [[0, 1], [2, 3], [4, 5], [6, 7]],
+                device="cuda",
+                dtype=torch.int32,
+            ),
+            torch.tensor(
+                [
+                    [0, 0, 0, 1, 1, 2, 3, 7],
+                    [7, 7, 6, 5, 4, 3, 2, 1],
+                ],
+                device="cuda",
+                dtype=torch.int32,
+            ),
+        )
+
+        for topk_ids in profiles:
+            hidden_states = torch.randn(
+                (topk_ids.shape[0], 256),
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            with self.subTest(top_k=topk_ids.shape[1]):
+                self._assert_fused_a1_matches_legacy(
+                    hidden_states,
+                    topk_ids,
+                    experts,
+                )
+
+    def test_fused_a1_reused_outputs_clear_dynamic_padding(self):
+        from sglang.kernels.ops.moe.flashinfer_sm120_fp8 import (
+            flashinfer_sm120_m_padded,
+            fused_quant_scatter_pack_flashinfer_sm120_fp8,
+            pack_flashinfer_sm120_fp8_scale,
+        )
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+
+        torch.manual_seed(103)
+        tokens, hidden, experts, top_k = 4, 256, 8, 2
+        routes = (
+            torch.tensor(
+                [[0, 0], [0, 1], [1, 1], [1, 1]],
+                device="cuda",
+                dtype=torch.int32,
+            ),
+            torch.tensor(
+                [[7, 7], [6, 7], [5, 6], [4, 7]],
+                device="cuda",
+                dtype=torch.int32,
+            ),
+        )
+        out = torch.empty(
+            (tokens * top_k, hidden),
+            device="cuda",
+            dtype=torch.float8_e4m3fn,
+        )
+        out_scale = torch.empty(
+            (
+                hidden // 128,
+                flashinfer_sm120_m_padded(tokens * top_k, experts),
+            ),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        out_ptr = out.data_ptr()
+        scale_ptr = out_scale.data_ptr()
+
+        for topk_ids in routes:
+            with self.subTest(topk_ids=topk_ids.cpu().tolist()):
+                hidden_states = torch.randn(
+                    (tokens, hidden),
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                )
+                ref_q, ref_scale = sglang_per_token_group_quant_fp8(
+                    hidden_states,
+                    128,
+                )
+                ref_packed, src2dst, m_indptr = moe_permute(
+                    ref_q,
+                    topk_ids,
+                    experts,
+                )
+                expected_scale = pack_flashinfer_sm120_fp8_scale(
+                    ref_scale,
+                    topk_ids,
+                    src2dst,
+                    m_indptr,
+                    source_is_packed=False,
+                )
+
+                out.view(torch.uint8).fill_(0x7F)
+                out_scale.fill_(float("nan"))
+                returned_q, returned_scale = (
+                    fused_quant_scatter_pack_flashinfer_sm120_fp8(
+                        hidden_states,
+                        topk_ids,
+                        src2dst,
+                        m_indptr,
+                        out=out,
+                        out_scale=out_scale,
+                    )
+                )
+                self.assertEqual(returned_q.data_ptr(), out_ptr)
+                self.assertEqual(returned_scale.data_ptr(), scale_ptr)
+                torch.testing.assert_close(
+                    returned_q.view(torch.uint8),
+                    ref_packed.view(torch.uint8),
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(
+                    returned_scale,
+                    expected_scale,
+                    rtol=0,
+                    atol=0,
+                )
+                padding = expected_scale == 0
+                self.assertTrue(bool(padding.any()))
+                self.assertTrue(bool((returned_scale[padding] == 0).all()))
+
+    def test_fused_a1_zero_padding_gap_is_safe(self):
+        torch.manual_seed(104)
+        hidden_states = torch.randn(
+            (4, 256),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        topk_ids = torch.zeros(
+            (4, 1),
+            device="cuda",
+            dtype=torch.int32,
+        )
+        self._assert_fused_a1_matches_legacy(
+            hidden_states,
+            topk_ids,
+            experts=1,
+        )
+        torch.cuda.synchronize()
+
+    def test_fused_a1_adapter_contract(self):
+        from sglang.kernels.ops.moe.flashinfer_sm120_fp8 import (
+            fused_quant_scatter_pack_flashinfer_sm120_fp8,
+        )
+
+        hidden = torch.randn(
+            (4, 256),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        topk = torch.tensor(
+            [[0, 1], [2, 3], [4, 5], [6, 7]],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        _, src2dst, m_indptr = moe_permute(hidden, topk, 8)
+        routes = topk.numel()
+        scale_shape = (2, ((routes + 3 * 8) // 4) * 4)
+        valid_out = torch.empty(
+            (routes, 256),
+            device="cuda",
+            dtype=torch.float8_e4m3fn,
+        )
+        valid_scale = torch.empty(
+            scale_shape,
+            device="cuda",
+            dtype=torch.float32,
+        )
+        misaligned_storage = torch.empty(
+            (valid_scale.numel() + 1,),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        misaligned_scale = misaligned_storage[1:].view(scale_shape)
+
+        hidden_noncontiguous = torch.randn(
+            (4, 512),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )[:, ::2]
+        topk_noncontiguous = torch.tensor(
+            [[0, 2, 4, 6], [1, 3, 5, 7]],
+            device="cuda",
+            dtype=torch.int32,
+        ).T
+        src2dst_storage = torch.empty(
+            (routes * 2,),
+            device="cuda",
+            dtype=torch.int32,
+        )
+        src2dst_noncontiguous = src2dst_storage[::2]
+        src2dst_noncontiguous.copy_(src2dst)
+        m_indptr_storage = torch.empty(
+            (m_indptr.numel() * 2,),
+            device="cuda",
+            dtype=torch.int32,
+        )
+        m_indptr_noncontiguous = m_indptr_storage[::2]
+        m_indptr_noncontiguous.copy_(m_indptr)
+        out_noncontiguous = torch.empty(
+            (routes, 512),
+            device="cuda",
+            dtype=torch.float8_e4m3fn,
+        )[:, ::2]
+        scale_noncontiguous = torch.empty(
+            (scale_shape[0], scale_shape[1] * 2),
+            device="cuda",
+            dtype=torch.float32,
+        )[:, ::2]
+
+        cases = (
+            ("hidden_states", {"hidden_states": hidden.float()}),
+            (
+                "hidden_states",
+                {"hidden_states": hidden[:, :129].contiguous()},
+            ),
+            ("contiguous", {"hidden_states": hidden_noncontiguous}),
+            ("topk_ids", {"topk_ids": topk.to(torch.int64)}),
+            ("contiguous", {"topk_ids": topk_noncontiguous}),
+            ("src2dst", {"src2dst": src2dst[:-1]}),
+            ("contiguous", {"src2dst": src2dst_noncontiguous}),
+            ("m_indptr", {"m_indptr": m_indptr.to(torch.int64)}),
+            ("contiguous", {"m_indptr": m_indptr_noncontiguous}),
+            ("CUDA", {"topk_ids": topk.cpu()}),
+            ("out", {"out": valid_out[:, :128]}),
+            (
+                "out",
+                {
+                    "out": torch.empty_like(
+                        valid_out,
+                        dtype=torch.uint8,
+                    )
+                },
+            ),
+            ("contiguous", {"out": out_noncontiguous}),
+            ("out_scale", {"out_scale": valid_scale[:, :-1]}),
+            (
+                "out_scale",
+                {"out_scale": valid_scale.to(torch.float64)},
+            ),
+            ("contiguous", {"out_scale": scale_noncontiguous}),
+            ("aligned", {"out_scale": misaligned_scale}),
+        )
+        defaults = {
+            "hidden_states": hidden,
+            "topk_ids": topk,
+            "src2dst": src2dst,
+            "m_indptr": m_indptr,
+            "out": valid_out,
+            "out_scale": valid_scale,
+        }
+        for message, override in cases:
+            arguments = defaults | override
+            with self.subTest(message=message), self.assertRaisesRegex(
+                (TypeError, ValueError),
+                message,
+            ):
+                fused_quant_scatter_pack_flashinfer_sm120_fp8(**arguments)
+
     def test_fused_swiglu_quant_pack_matches_legacy_reference(self):
         from sglang.jit_kernel.activation import silu_and_mul
         from sglang.kernels.ops.moe.flashinfer_sm120_fp8 import (
