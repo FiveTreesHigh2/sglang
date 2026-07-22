@@ -4,6 +4,7 @@ import importlib.util
 import json
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,33 @@ def load_down_tuning_utils():
     sys.modules[spec.name] = module
     try:
         spec.loader.exec_module(module)
+    finally:
+        if previous is None:
+            sys.modules.pop(spec.name, None)
+        else:
+            sys.modules[spec.name] = previous
+    return module
+
+
+@contextmanager
+def tuner_directory_on_path():
+    sys.path.insert(0, str(TUNER_DIR))
+    try:
+        yield
+    finally:
+        sys.path.remove(str(TUNER_DIR))
+
+
+def load_sep_tuner():
+    path = TUNER_DIR / "tuning_fused_moe_triton_sep.py"
+    spec = importlib.util.spec_from_file_location("tuning_fused_moe_triton_sep", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(spec.name)
+    sys.modules[spec.name] = module
+    try:
+        with tuner_directory_on_path():
+            spec.loader.exec_module(module)
     finally:
         if previous is None:
             sys.modules.pop(spec.name, None)
@@ -202,3 +230,94 @@ def test_atomic_json_writer_creates_parent_and_complete_document() -> None:
 
         assert json.loads(output.read_text()) == payload
         assert not tuple(output.parent.glob(f".{output.name}.*.tmp"))
+
+
+def test_cli_accepts_approved_down_tuning_contract() -> None:
+    sep = load_sep_tuner()
+
+    args = sep.parse_args(
+        [
+            "--model",
+            "/model",
+            "--tp-size",
+            "1",
+            "--ep-size",
+            "1",
+            "--dtype",
+            "fp8_w8a8",
+            "--kernel",
+            "down",
+            "--batch-sizes",
+            "1",
+            "8",
+            "32",
+            "128",
+            "512",
+            "2048",
+            "4096",
+            "6144",
+            "8192",
+            "--route-profiles",
+            "uniform",
+            "synthetic-skew",
+            "--route-seeds",
+            "0",
+            "1",
+            "2",
+            "--full-search-size",
+            "8192",
+            "--shortlist-size",
+            "16",
+            "--output",
+            "/tmp/down.json",
+            "--tune",
+        ]
+    )
+
+    assert args.kernel == "down"
+    assert args.batch_sizes == [1, 8, 32, 128, 512, 2048, 4096, 6144, 8192]
+    assert args.route_profiles == ["uniform", "synthetic-skew"]
+    assert args.route_seeds == [0, 1, 2]
+    assert args.full_search_size == 8192
+    assert args.shortlist_size == 16
+    assert args.output == "/tmp/down.json"
+    assert args.topk_ids_dir is None
+
+
+def test_cli_rejects_conflicting_batch_size_forms() -> None:
+    sep = load_sep_tuner()
+
+    with pytest.raises(SystemExit):
+        sep.parse_args(
+            [
+                "--batch-size",
+                "8192",
+                "--batch-sizes",
+                "4096",
+                "8192",
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--kernel", "down", "--tune", "--batch-sizes", "8192"],
+        [
+            "--kernel",
+            "down",
+            "--tune",
+            "--batch-sizes",
+            "4096",
+            "--full-search-size",
+            "8192",
+            "--output",
+            "/tmp/down.json",
+        ],
+    ],
+)
+def test_cli_rejects_incomplete_down_tuning_contract(argv: list[str]) -> None:
+    sep = load_sep_tuner()
+
+    with pytest.raises(SystemExit):
+        sep.parse_args(argv)
