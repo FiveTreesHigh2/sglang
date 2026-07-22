@@ -6,9 +6,11 @@ import dataclasses
 import json
 import os
 import statistics
+import sys
 import time
 from contextlib import nullcontext
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -26,7 +28,10 @@ from down_tuning_utils import (
     ROUTE_PROFILES,
     candidate_key,
     generate_topk_ids,
+    select_robust_candidate,
+    shortlist_candidate_keys,
     validate_anchor_sizes,
+    write_json_atomic,
 )
 from tqdm import tqdm
 
@@ -37,6 +42,7 @@ from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
     moe_align_block_size,
 )
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
+    get_default_config,
     get_config_file_name,
 )
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
@@ -771,6 +777,175 @@ class BenchmarkWorker:
                     print(f"  config {i} {cfg}: {kernel_times[i]}")
 
 
+def _runtime_config_from_selection(
+    selection: Dict[str, Any],
+    records: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    selected = selection["candidate"]
+    record = next(
+        (record for record in records if record["candidate"] == selected),
+        None,
+    )
+    if record is None:
+        raise RuntimeError(f"selected candidate {selected!r} has no timing record")
+    config = dict(record["config"])
+    config["USE_TMA"] = bool(record["use_tma"])
+    return sort_config(config)
+
+
+def run_staged_down_search(
+    *,
+    batch_sizes: Sequence[int],
+    full_search_size: int,
+    search_space: Sequence[Dict[str, int]],
+    default_configs: Dict[int, Dict[str, int]],
+    route_profiles: Sequence[str],
+    route_seeds: Sequence[int],
+    shortlist_size: int,
+    coarse_iters: int,
+    stable_iters: int,
+    benchmark: Callable[..., List[Dict[str, Any]]],
+) -> Dict[str, Any]:
+    anchors = validate_anchor_sizes(batch_sizes, full_search_size)
+    if not search_space:
+        raise ValueError("search_space must not be empty")
+    if not route_profiles or not route_seeds:
+        raise ValueError("route profiles and seeds must not be empty")
+
+    raw_timings = {
+        "coarse": [],
+        "stable_full": [],
+        "stable_anchors": {},
+    }
+    rejections = []
+
+    def evaluate(
+        num_tokens: int,
+        config: Dict[str, int],
+        profiles: Sequence[str],
+        seeds: Sequence[int],
+        num_iters: int,
+        phase: str,
+    ) -> List[Dict[str, Any]]:
+        try:
+            return benchmark(
+                num_tokens,
+                config,
+                profiles,
+                seeds,
+                num_iters,
+                phase,
+            )
+        except (triton.runtime.autotuner.OutOfResources, RuntimeError) as error:
+            rejections.append(
+                {
+                    "phase": phase,
+                    "num_tokens": num_tokens,
+                    "config": dict(config),
+                    "error": f"{type(error).__name__}: {error}",
+                }
+            )
+            return []
+
+    coarse_seed = [route_seeds[0]]
+    for config in search_space:
+        raw_timings["coarse"].extend(
+            evaluate(
+                full_search_size,
+                dict(config),
+                route_profiles,
+                coarse_seed,
+                coarse_iters,
+                "coarse",
+            )
+        )
+    if not raw_timings["coarse"]:
+        raise RuntimeError("every coarse-search candidate failed")
+
+    shortlisted_keys = shortlist_candidate_keys(
+        raw_timings["coarse"],
+        per_workload=shortlist_size,
+    )
+    shortlisted_configs = {}
+    for record in raw_timings["coarse"]:
+        if record["candidate"] not in shortlisted_keys:
+            continue
+        config = dict(record["config"])
+        shortlisted_configs[candidate_key(config, False)] = config
+
+    for config in shortlisted_configs.values():
+        raw_timings["stable_full"].extend(
+            evaluate(
+                full_search_size,
+                config,
+                route_profiles,
+                route_seeds,
+                stable_iters,
+                "stable-full",
+            )
+        )
+    if not raw_timings["stable_full"]:
+        raise RuntimeError("every stable full-search candidate failed")
+
+    full_selection = select_robust_candidate(raw_timings["stable_full"])
+    runtime_configs = {
+        str(full_search_size): _runtime_config_from_selection(
+            full_selection,
+            raw_timings["stable_full"],
+        )
+    }
+    selections = {str(full_search_size): full_selection}
+
+    for num_tokens in anchors:
+        if num_tokens == full_search_size:
+            continue
+        candidates = dict(shortlisted_configs)
+        default_config = dict(default_configs[num_tokens])
+        candidates[candidate_key(default_config, False)] = default_config
+        anchor_records = []
+        for config in candidates.values():
+            anchor_records.extend(
+                evaluate(
+                    num_tokens,
+                    config,
+                    route_profiles,
+                    route_seeds,
+                    stable_iters,
+                    "stable-anchor",
+                )
+            )
+        if not anchor_records:
+            raise RuntimeError(f"every candidate failed for anchor {num_tokens}")
+        raw_timings["stable_anchors"][str(num_tokens)] = anchor_records
+        selection = select_robust_candidate(anchor_records)
+        selections[str(num_tokens)] = selection
+        runtime_configs[str(num_tokens)] = _runtime_config_from_selection(
+            selection,
+            anchor_records,
+        )
+
+    runtime_configs = {
+        key: runtime_configs[key]
+        for key in sorted(runtime_configs, key=int)
+    }
+    return {
+        "configs": runtime_configs,
+        "raw_timings": raw_timings,
+        "selections": selections,
+        "rejections": rejections,
+        "metadata": {
+            "batch_sizes": list(anchors),
+            "full_search_size": full_search_size,
+            "search_space_size": len(search_space),
+            "shortlisted_config_count": len(shortlisted_configs),
+            "route_profiles": list(route_profiles),
+            "route_seeds": list(route_seeds),
+            "coarse_iters": coarse_iters,
+            "stable_iters": stable_iters,
+        },
+    }
+
+
 def save_configs_sep(
     configs: Dict[int, BenchmarkConfig],
     num_experts: int,
@@ -837,7 +1012,9 @@ def main(args: argparse.Namespace):
     use_int4_w4a16 = args.dtype == "int4_w4a16"
 
     topk_ids_dir = args.topk_ids_dir
-    if args.batch_size is None:
+    if args.batch_sizes is not None:
+        batch_sizes = list(args.batch_sizes)
+    elif args.batch_size is None:
         batch_sizes = get_default_batch_sizes()
         batch_sizes.reverse()
     else:
@@ -861,6 +1038,132 @@ def main(args: argparse.Namespace):
             topk_ids_dir,
             args.ep_size,
         )
+        return
+
+    if args.kernel == "down" and args.tune:
+        worker = BenchmarkWorker(args.seed, server_args)
+        search_space = get_configs_compute_bound()
+        if block_shape is not None:
+            block_k = block_shape[1]
+            search_space = [
+                config
+                for config in search_space
+                if block_k % config["BLOCK_SIZE_K"] == 0
+            ]
+        if args.max_configs is not None:
+            search_space = search_space[: args.max_configs]
+
+        dtype_str = get_config_dtype_str(
+            dtype,
+            use_int8_w8a16=use_int8_w8a16,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int4_w4a16=use_int4_w4a16,
+        )
+        default_configs = {
+            num_tokens: get_default_config(
+                num_tokens,
+                E,
+                shard_intermediate_size,
+                hidden_size,
+                topk,
+                dtype_str,
+                False,
+                block_shape,
+            )
+            for num_tokens in batch_sizes
+        }
+        progress = {"completed": 0}
+
+        def benchmark_down(
+            num_tokens,
+            config,
+            profiles,
+            seeds,
+            num_iters,
+            phase,
+        ):
+            progress["completed"] += 1
+            current = progress["completed"]
+            if current == 1 or current % 25 == 0:
+                print(
+                    f"[tune] phase={phase} calls={current} "
+                    f"num_tokens={num_tokens} config={config}",
+                    flush=True,
+                )
+            return worker.benchmark_down_candidate(
+                num_tokens,
+                E,
+                shard_intermediate_size,
+                hidden_size,
+                topk,
+                dtype,
+                use_fp8_w8a8,
+                use_int8_w8a8,
+                use_int8_w8a16,
+                use_int4_w4a16,
+                block_shape,
+                config,
+                topk_ids_dir,
+                profiles,
+                seeds,
+                args.ep_size,
+                num_iters,
+            )
+
+        result = run_staged_down_search(
+            batch_sizes=batch_sizes,
+            full_search_size=args.full_search_size,
+            search_space=search_space,
+            default_configs=default_configs,
+            route_profiles=args.route_profiles,
+            route_seeds=args.route_seeds,
+            shortlist_size=args.shortlist_size,
+            coarse_iters=args.coarse_iters,
+            stable_iters=args.stable_iters,
+            benchmark=benchmark_down,
+        )
+        config_filename = get_config_file_name(
+            E,
+            shard_intermediate_size // 2,
+            dtype_str,
+            block_shape,
+            down_moe=True,
+        )
+        result["metadata"].update(
+            {
+                "model": args.model,
+                "tp_size": args.tp_size,
+                "ep_size": args.ep_size,
+                "dtype": dtype_str,
+                "num_experts": E,
+                "topk": topk,
+                "hidden_size": hidden_size,
+                "shard_intermediate_size": shard_intermediate_size,
+                "block_shape": block_shape,
+                "device": torch.cuda.get_device_name(),
+                "torch_version": torch.__version__,
+                "triton_version": triton.__version__,
+                "config_filename": config_filename,
+                "command": sys.argv,
+            }
+        )
+        output_path = Path(args.output)
+        timings_path = output_path.with_name(
+            f"{output_path.stem}.timings.json"
+        )
+        write_json_atomic(output_path, result["configs"])
+        write_json_atomic(
+            timings_path,
+            {
+                key: value
+                for key, value in result.items()
+                if key != "configs"
+            },
+        )
+        print(f"TRITON_DOWN_CONFIG={output_path}")
+        print(f"TRITON_DOWN_TIMINGS={timings_path}")
+        print(f"TRITON_DOWN_CONFIG_FILENAME={config_filename}")
         return
 
     if len(batch_sizes) == 1:
@@ -1106,11 +1409,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--full-search-size", type=int)
     parser.add_argument("--shortlist-size", type=int, default=16)
+    parser.add_argument("--coarse-iters", type=int, default=20)
+    parser.add_argument("--stable-iters", type=int, default=100)
+    parser.add_argument("--max-configs", type=int)
     parser.add_argument("--output", type=str)
     args = parser.parse_args(argv)
 
     if args.shortlist_size <= 0:
         parser.error("--shortlist-size must be positive")
+    if args.coarse_iters <= 0 or args.coarse_iters % 10 != 0:
+        parser.error("--coarse-iters must be a positive multiple of 10")
+    if args.stable_iters <= 0 or args.stable_iters % 10 != 0:
+        parser.error("--stable-iters must be a positive multiple of 10")
+    if args.max_configs is not None and args.max_configs <= 0:
+        parser.error("--max-configs must be positive")
     if args.kernel == "down" and not args.tune and args.cmp_configs is None:
         if args.batch_size is None:
             parser.error("manual --kernel down benchmark requires --batch-size")

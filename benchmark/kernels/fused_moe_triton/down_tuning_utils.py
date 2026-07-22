@@ -102,6 +102,39 @@ def select_robust_candidate(
     }
 
 
+def shortlist_candidate_keys(
+    records: Sequence[Mapping[str, Any]],
+    per_workload: int,
+) -> Tuple[str, ...]:
+    if per_workload <= 0:
+        raise ValueError(f"per_workload must be positive, got {per_workload}")
+    if not records:
+        raise ValueError("records must not be empty")
+
+    samples = defaultdict(lambda: defaultdict(list))
+    for record in records:
+        workload = (str(record["profile"]), int(record["seed"]))
+        candidate = str(record["candidate"])
+        latency = float(record["median_ms"])
+        if not math.isfinite(latency) or latency <= 0:
+            raise ValueError(
+                f"median_ms must be finite and positive, got {latency}"
+            )
+        samples[workload][candidate].append(latency)
+
+    selected = set()
+    for candidates in samples.values():
+        ranked = sorted(
+            (
+                statistics.median(latencies),
+                candidate,
+            )
+            for candidate, latencies in candidates.items()
+        )
+        selected.update(candidate for _, candidate in ranked[:per_workload])
+    return tuple(sorted(selected))
+
+
 def validate_anchor_sizes(
     batch_sizes: Sequence[int], full_search_size: int
 ) -> Tuple[int, ...]:
