@@ -56,7 +56,7 @@
 
 **Interfaces:**
 - Consumes: 活跃服务器的 `GET /server_info`、`python -m sglang.bench_serving` 最后一条 JSONL 结果、当前 Git checkout 和已安装 package metadata。
-- Produces: `capture` manifest schema 1、`compare` decision JSON、`build_run_key()`、`verify_server_info()`、`compare_manifests()`。
+- Produces: `capture` manifest schema 1、`compare` decision JSON、`build_run_key()`、`verify_server_info()`、`evaluate_speedup_gate()`、`compare_manifests()`。
 
 - [ ] **Step 1: 写 constants、server contract 和 run-key RED 测试**
 
@@ -353,6 +353,13 @@ def build_run_key(*, backend: str, commit: str, input_length: int,
     })
 
 
+def evaluate_speedup_gate(input_length: int, speedups: Sequence[float]) -> bool:
+    median = statistics.median(speedups)
+    if input_length == 4096:
+        return median >= 0.10 and min(speedups) >= 0.0
+    return median > 0.0 and min(speedups) > 0.0
+
+
 def compare_manifests(triton: dict[str, Any], flashinfer: dict[str, Any]) -> dict[str, Any]:
     if triton["metadata"]["pairing_hash"] != flashinfer["metadata"]["pairing_hash"]:
         raise ValueError("pairing_hash mismatch")
@@ -388,10 +395,7 @@ def compare_manifests(triton: dict[str, Any], flashinfer: dict[str, Any]) -> dic
                 raise ValueError("total_input_tokens mismatch")
             samples.append(b["input_throughput"] / a["input_throughput"] - 1.0)
         median = statistics.median(samples)
-        if length == 4096:
-            passed = median >= 0.10 and min(samples) >= 0.0
-        else:
-            passed = median > 0.0 and min(samples) > 0.0
+        passed = evaluate_speedup_gate(length, samples)
         go = go and passed
         by_length[str(length)] = {
             "paired_speedups": samples,
