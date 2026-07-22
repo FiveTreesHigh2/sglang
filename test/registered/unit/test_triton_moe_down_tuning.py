@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -92,3 +94,111 @@ def test_route_generation_rejects_invalid_contract(
             profile,
             seed=0,
         )
+
+
+def test_candidate_key_is_canonical_and_includes_tma_mode() -> None:
+    utils = load_down_tuning_utils()
+    left = {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 16,
+        "num_warps": 8,
+        "num_stages": 4,
+    }
+    right = dict(reversed(tuple(left.items())))
+
+    assert utils.candidate_key(left, False) == utils.candidate_key(right, False)
+    assert utils.candidate_key(left, False) != utils.candidate_key(left, True)
+
+
+def test_robust_selection_minimizes_worst_profile_regret() -> None:
+    utils = load_down_tuning_utils()
+    records = [
+        {
+            "candidate": "fast-uniform",
+            "profile": "uniform",
+            "seed": 0,
+            "median_ms": 1.00,
+        },
+        {
+            "candidate": "fast-uniform",
+            "profile": "synthetic-skew",
+            "seed": 0,
+            "median_ms": 1.50,
+        },
+        {
+            "candidate": "robust",
+            "profile": "uniform",
+            "seed": 0,
+            "median_ms": 1.05,
+        },
+        {
+            "candidate": "robust",
+            "profile": "synthetic-skew",
+            "seed": 0,
+            "median_ms": 1.08,
+        },
+    ]
+
+    selection = utils.select_robust_candidate(records)
+
+    assert selection["candidate"] == "robust"
+    assert selection["max_regret"] == pytest.approx(0.05)
+    assert selection["workload_count"] == 2
+
+
+def test_robust_selection_rejects_incomplete_candidates() -> None:
+    utils = load_down_tuning_utils()
+    records = [
+        {
+            "candidate": "complete",
+            "profile": "uniform",
+            "seed": 0,
+            "median_ms": 1.0,
+        },
+        {
+            "candidate": "complete",
+            "profile": "synthetic-skew",
+            "seed": 0,
+            "median_ms": 1.1,
+        },
+        {
+            "candidate": "incomplete",
+            "profile": "uniform",
+            "seed": 0,
+            "median_ms": 0.1,
+        },
+    ]
+
+    assert utils.select_robust_candidate(records)["candidate"] == "complete"
+
+
+def test_anchor_validation_sorts_deduplicates_and_requires_full_search() -> None:
+    utils = load_down_tuning_utils()
+
+    assert utils.validate_anchor_sizes(
+        [8192, 1, 8, 4096, 8192],
+        8192,
+    ) == (1, 8, 4096, 8192)
+    with pytest.raises(ValueError, match="full search"):
+        utils.validate_anchor_sizes([2048, 4096], 8192)
+    with pytest.raises(ValueError, match="positive"):
+        utils.validate_anchor_sizes([0, 8192], 8192)
+
+
+def test_atomic_json_writer_creates_parent_and_complete_document() -> None:
+    utils = load_down_tuning_utils()
+    payload = {
+        "8192": {
+            "BLOCK_SIZE_M": 64,
+            "USE_TMA": True,
+        }
+    }
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        output = Path(temp_dir) / "nested" / "down.json"
+        utils.write_json_atomic(output, payload)
+
+        assert json.loads(output.read_text()) == payload
+        assert not tuple(output.parent.glob(f".{output.name}.*.tmp"))
