@@ -4,6 +4,7 @@ import json
 import sys
 from itertools import product
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -321,6 +322,18 @@ def test_compare_rejects_token_count_mismatch_between_paired_cases(bench):
         bench.compare_manifests(triton, flashinfer)
 
 
+@pytest.mark.parametrize("side", ("triton", "flashinfer"))
+def test_compare_rejects_unsupported_schema_on_either_manifest_side(bench, side):
+    ratios = passing_ratios()
+    triton = manifest("triton", ratios)
+    flashinfer = manifest("flashinfer_sm120_fp8", ratios)
+    target = triton if side == "triton" else flashinfer
+    target["schema_version"] = 2
+
+    with pytest.raises(ValueError, match="schema_version"):
+        bench.compare_manifests(triton, flashinfer)
+
+
 @pytest.mark.parametrize(
     ("field", "changed_value"),
     (
@@ -348,16 +361,12 @@ def test_compare_rejects_each_paired_metadata_drift(bench, field, changed_value)
         bench.compare_manifests(triton, flashinfer)
 
 
-def test_capture_runs_warmup_and_all_formal_cases_with_fixed_bench_contract(
-    bench, monkeypatch, tmp_path
-):
-    commands = []
-    commit = "d" * 40
-    args = argparse.Namespace(
+def capture_args(tmp_path, *, expected_backend="triton", a1_mode="not_applicable"):
+    return argparse.Namespace(
         host="127.0.0.1",
         port=30000,
-        expected_backend="triton",
-        a1_mode="not_applicable",
+        expected_backend=expected_backend,
+        a1_mode=a1_mode,
         server_log=None,
         repo=tmp_path,
         dataset_path=tmp_path / "random.json",
@@ -366,6 +375,9 @@ def test_capture_runs_warmup_and_all_formal_cases_with_fixed_bench_contract(
         output=tmp_path / "manifest.json",
     )
 
+
+def install_capture_environment(bench, monkeypatch, commands):
+    commit = "d" * 40
     monkeypatch.setattr(bench, "fetch_server_info", lambda host, port: server_info())
     monkeypatch.setattr(bench, "git_commit", lambda repo: commit)
     monkeypatch.setattr(bench, "query_single_gpu_uuid", lambda: "GPU-test")
@@ -400,6 +412,14 @@ def test_capture_runs_warmup_and_all_formal_cases_with_fixed_bench_contract(
         )
 
     monkeypatch.setattr(bench.subprocess, "run", fake_run)
+
+
+def test_capture_runs_warmup_and_all_formal_cases_with_fixed_bench_contract(
+    bench, monkeypatch, tmp_path
+):
+    commands = []
+    args = capture_args(tmp_path)
+    install_capture_environment(bench, monkeypatch, commands)
     result = bench.run_capture(args)
 
     assert len(result["cases"]) == len(INPUT_LENGTHS) * len(SEEDS)
@@ -410,6 +430,7 @@ def test_capture_runs_warmup_and_all_formal_cases_with_fixed_bench_contract(
         assert command[command.index("--dataset-name") + 1] == "random"
         assert command[command.index("--random-output-len") + 1] == "1"
         assert command[command.index("--random-range-ratio") + 1] == "1"
+        assert command[command.index("--warmup-requests") + 1] == "0"
         assert "--flush-cache" in command
 
     warmup = next(
@@ -429,3 +450,61 @@ def test_capture_runs_warmup_and_all_formal_cases_with_fixed_bench_contract(
         )
         for command in formal_cases
     } == {(length, NUM_PROMPTS, seed) for length in INPUT_LENGTHS for seed in SEEDS}
+
+
+def test_capture_repeats_explicit_warmup_but_reuses_formal_results(
+    bench, monkeypatch, tmp_path
+):
+    commands = []
+    args = capture_args(tmp_path)
+    install_capture_environment(bench, monkeypatch, commands)
+
+    bench.run_capture(args)
+    bench.run_capture(args)
+
+    warmups = [
+        command
+        for command in commands
+        if command[command.index("--num-prompts") + 1] == "1"
+    ]
+    formal_cases = [command for command in commands if command not in warmups]
+    assert len(warmups) == 2
+    assert len(formal_cases) == len(INPUT_LENGTHS) * len(SEEDS)
+
+
+def test_capture_validates_flashinfer_marker_before_benchmark_or_manifest(
+    bench, monkeypatch, tmp_path
+):
+    args = capture_args(
+        tmp_path,
+        expected_backend="flashinfer_sm120_fp8",
+        a1_mode="fused",
+    )
+    args.server_log = tmp_path / "server.log"
+    args.server_log.write_text("server started without the A1 marker\n")
+
+    monkeypatch.setattr(
+        bench,
+        "fetch_server_info",
+        lambda host, port: server_info("flashinfer_sm120_fp8"),
+    )
+    monkeypatch.setattr(bench, "git_commit", lambda repo: "d" * 40)
+    monkeypatch.setattr(bench, "query_single_gpu_uuid", lambda: "GPU-test")
+    monkeypatch.setattr(
+        bench.importlib.metadata,
+        "version",
+        lambda package: {
+            "flashinfer-python": "0.6.15.dev20260716",
+            "sglang-kernel": "0.4.4",
+        }[package],
+    )
+    monkeypatch.setattr(bench.torch, "__version__", "2.11.0")
+    monkeypatch.setattr(bench.torch.version, "cuda", "13.0")
+    run = Mock(side_effect=AssertionError("benchmark ran before A1 marker validation"))
+    monkeypatch.setattr(bench.subprocess, "run", run)
+
+    with pytest.raises(ValueError, match="server log missing A1 marker"):
+        bench.run_capture(args)
+
+    run.assert_not_called()
+    assert not args.output.exists()
