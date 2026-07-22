@@ -412,3 +412,69 @@ def test_captured_route_source_preserves_legacy_loader(monkeypatch) -> None:
         for actual, expected in zip(sources["captured"], captured)
     )
     assert calls == [("/routes", 0), ("/routes", 1), ("/routes", 2)]
+
+
+def test_down_only_wrapper_selection_constructs_and_times_down_variants() -> None:
+    sep = load_sep_tuner()
+    construction_calls = []
+
+    class FakeWrapper:
+        def __init__(self, cost: float):
+            self.cost = cost
+            self.forward_calls = 0
+
+        def forward_cost(self) -> float:
+            self.forward_calls += 1
+            return self.cost
+
+    costs = {
+        ("up", False): 2.0,
+        ("up", True): 1.8,
+        ("down", False): 1.0,
+        ("down", True): 0.8,
+    }
+
+    def factory(operation: str, use_tma: bool) -> FakeWrapper:
+        construction_calls.append((operation, use_tma))
+        return FakeWrapper(costs[(operation, use_tma)])
+
+    wrappers = sep.build_selected_kernel_wrappers("down", factory)
+    prepare_calls = []
+    timings = sep.benchmark_kernel_wrappers(
+        wrappers,
+        prepare=lambda index, inner_iter: prepare_calls.append(
+            (index, inner_iter)
+        ),
+        num_iters=20,
+        inner_iter=10,
+        warmup=True,
+    )
+
+    assert construction_calls == [("down", False), ("down", True)]
+    assert tuple(wrappers) == ("down", "down_tma")
+    assert timings == pytest.approx({"down": 100.0, "down_tma": 80.0})
+    assert prepare_calls == [(0, 10), (1, 10)]
+    assert all(wrapper.forward_calls == 3 for wrapper in wrappers.values())
+
+
+@pytest.mark.parametrize(
+    ("kernel", "expected"),
+    [
+        ("up", (("up", False), ("up", True))),
+        ("both", (("up", False), ("up", True), ("down", False), ("down", True))),
+    ],
+)
+def test_wrapper_selection_preserves_up_and_legacy_both_modes(
+    kernel: str,
+    expected: tuple[tuple[str, bool], ...],
+) -> None:
+    sep = load_sep_tuner()
+    calls = []
+
+    def factory(operation: str, use_tma: bool):
+        calls.append((operation, use_tma))
+        return object()
+
+    sep.build_selected_kernel_wrappers(kernel, factory)
+
+    assert tuple(calls) == expected
