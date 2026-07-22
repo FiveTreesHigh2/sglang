@@ -426,9 +426,19 @@ def test_capture_runs_warmup_and_all_formal_cases_with_fixed_bench_contract(
     assert len(result["cases"]) == len(INPUT_LENGTHS) * len(SEEDS)
     assert len(commands) == 1 + len(INPUT_LENGTHS) * len(SEEDS)
     for command in commands:
-        assert command[:3] == [sys.executable, "-m", "sglang.bench_serving"]
+        assert command[:3] == [
+            sys.executable,
+            "-m",
+            "sglang.benchmark.serving",
+        ]
         assert command[command.index("--backend") + 1] == "sglang"
         assert command[command.index("--dataset-name") + 1] == "random"
+        assert command[command.index("--model") + 1] == "/models/qwen"
+        assert (
+            command[command.index("--served-model-name") + 1]
+            == "qwen35-fp8"
+        )
+        assert command[command.index("--tokenizer") + 1] == "/models/qwen"
         assert command[command.index("--random-output-len") + 1] == "1"
         assert command[command.index("--random-range-ratio") + 1] == "1"
         assert command[command.index("--warmup-requests") + 1] == "0"

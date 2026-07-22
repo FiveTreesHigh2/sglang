@@ -297,7 +297,7 @@ def run_capture(args: argparse.Namespace) -> dict[str, Any]:
         return [
             sys.executable,
             "-m",
-            "sglang.bench_serving",
+            "sglang.benchmark.serving",
             "--backend",
             "sglang",
             "--dataset-name",
@@ -323,7 +323,11 @@ def run_capture(args: argparse.Namespace) -> dict[str, Any]:
             "--host",
             args.host,
             "--model",
+            snapshot["model_path"],
+            "--served-model-name",
             snapshot["served_model_name"],
+            "--tokenizer",
+            snapshot["model_path"],
             "--flush-cache",
         ]
 
