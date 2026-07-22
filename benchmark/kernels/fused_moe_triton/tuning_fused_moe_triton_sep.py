@@ -8,7 +8,7 @@ import os
 import time
 from contextlib import nullcontext
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import ray
 import torch
@@ -121,6 +121,56 @@ class KernelWrapper:
             torch.cuda.synchronize()
             time_cost = min(time_cost, start_event.elapsed_time(end_event))
         return time_cost
+
+
+def build_selected_kernel_wrappers(
+    kernel: str,
+    factory: Callable[[str, bool], Any],
+) -> Dict[str, Any]:
+    if kernel not in ("up", "down", "both"):
+        raise ValueError(f"unsupported kernel selection: {kernel!r}")
+
+    wrappers = {}
+    if kernel in ("up", "both"):
+        wrappers["up"] = factory("up", False)
+        wrappers["up_tma"] = factory("up", True)
+    if kernel in ("down", "both"):
+        wrappers["down"] = factory("down", False)
+        wrappers["down_tma"] = factory("down", True)
+    return wrappers
+
+
+def benchmark_kernel_wrappers(
+    wrappers: Dict[str, Any],
+    prepare: Callable[[int, int], None],
+    num_iters: int,
+    inner_iter: int,
+    warmup: bool,
+) -> Dict[str, float]:
+    if not wrappers:
+        raise ValueError("wrappers must not be empty")
+    if num_iters <= 0 or inner_iter <= 0:
+        raise ValueError("num_iters and inner_iter must be positive")
+    if num_iters % inner_iter != 0:
+        raise ValueError(
+            f"num_iters must be divisible by inner_iter, got {num_iters=} "
+            f"and {inner_iter=}"
+        )
+
+    if warmup:
+        for wrapper in wrappers.values():
+            wrapper.forward_cost()
+
+    samples = {name: [] for name in wrappers}
+    for index in range(num_iters // inner_iter):
+        prepare(index, inner_iter)
+        for name, wrapper in wrappers.items():
+            samples[name].append(wrapper.forward_cost())
+
+    return {
+        name: sum(costs) / num_iters * 1000
+        for name, costs in samples.items()
+    }
 
 
 def load_topk_ids(topk_ids_dir, i: int):
