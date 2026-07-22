@@ -4,8 +4,10 @@ import importlib.util
 import json
 import sys
 import tempfile
+import types
 from contextlib import contextmanager
 from pathlib import Path
+from unittest import mock
 
 import pytest
 import torch
@@ -48,8 +50,22 @@ def load_sep_tuner():
     module = importlib.util.module_from_spec(spec)
     previous = sys.modules.get(spec.name)
     sys.modules[spec.name] = module
+    ray = types.ModuleType("ray")
+    ray_experimental = types.ModuleType("ray.experimental")
+    ray_tqdm = types.ModuleType("ray.experimental.tqdm_ray")
+    ray_tqdm.tqdm = lambda iterable: iterable
+    ray.experimental = ray_experimental
+    ray_experimental.tqdm_ray = ray_tqdm
+    optional_modules = {
+        "ray": ray,
+        "ray.experimental": ray_experimental,
+        "ray.experimental.tqdm_ray": ray_tqdm,
+    }
     try:
-        with tuner_directory_on_path():
+        with (
+            tuner_directory_on_path(),
+            mock.patch.dict(sys.modules, optional_modules),
+        ):
             spec.loader.exec_module(module)
     finally:
         if previous is None:
