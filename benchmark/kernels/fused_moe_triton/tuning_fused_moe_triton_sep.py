@@ -8,7 +8,7 @@ import os
 import time
 from contextlib import nullcontext
 from datetime import datetime
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import ray
 import torch
@@ -22,6 +22,7 @@ from common_utils import (
     get_model_config,
     sort_config,
 )
+from down_tuning_utils import ROUTE_PROFILES, validate_anchor_sizes
 from ray.experimental.tqdm_ray import tqdm
 
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
@@ -870,7 +871,7 @@ def main(args: argparse.Namespace):
     print(f"Tuning took {end - start:.2f} seconds")
 
 
-if __name__ == "__main__":
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model", type=str, default="mistralai/Mixtral-8x7B-Instruct-v0.1"
@@ -884,12 +885,65 @@ if __name__ == "__main__":
         default="auto",
     )
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--batch-size", type=int, required=False)
+    batch_size_group = parser.add_mutually_exclusive_group()
+    batch_size_group.add_argument("--batch-size", type=int, required=False)
+    batch_size_group.add_argument(
+        "--batch-sizes", type=int, nargs="+", required=False
+    )
     parser.add_argument("--tune", action="store_true")
     parser.add_argument("--disable-shared-experts-fusion", action="store_true")
     parser.add_argument("--configs", type=int, nargs="+", required=False)
-    parser.add_argument("--topk-ids-dir", type=str, required=True)
+    parser.add_argument("--topk-ids-dir", type=str)
     parser.add_argument("--cmp-configs", type=str, nargs="+", required=False)
-    args = parser.parse_args()
+    parser.add_argument(
+        "--kernel",
+        choices=("up", "down", "both"),
+        default="both",
+    )
+    parser.add_argument(
+        "--route-profiles",
+        nargs="+",
+        choices=ROUTE_PROFILES,
+        default=list(ROUTE_PROFILES),
+    )
+    parser.add_argument(
+        "--route-seeds",
+        type=int,
+        nargs="+",
+        default=[0, 1, 2],
+    )
+    parser.add_argument("--full-search-size", type=int)
+    parser.add_argument("--shortlist-size", type=int, default=16)
+    parser.add_argument("--output", type=str)
+    args = parser.parse_args(argv)
+
+    if args.shortlist_size <= 0:
+        parser.error("--shortlist-size must be positive")
+    if args.kernel == "down" and args.tune:
+        if args.batch_sizes is None:
+            parser.error("--kernel down --tune requires --batch-sizes")
+        if args.output is None:
+            parser.error("--kernel down --tune requires --output")
+        if args.full_search_size is None:
+            args.full_search_size = max(args.batch_sizes)
+        try:
+            args.batch_sizes = list(
+                validate_anchor_sizes(
+                    args.batch_sizes,
+                    args.full_search_size,
+                )
+            )
+        except ValueError as error:
+            parser.error(str(error))
+    elif args.kernel != "down" and args.topk_ids_dir is None:
+        parser.error(
+            "--topk-ids-dir is required for legacy up/both tuning; "
+            "use --kernel down for generated route profiles"
+        )
+    return args
+
+
+if __name__ == "__main__":
+    args = parse_args()
 
     main(args)
