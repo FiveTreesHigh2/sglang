@@ -163,7 +163,12 @@ def _validate_route_contract(
 def _expert_permutation(num_experts: int, seed: int) -> torch.Tensor:
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
-    return torch.randperm(num_experts, generator=generator, dtype=torch.int64)
+    return torch.randperm(
+        num_experts,
+        generator=generator,
+        dtype=torch.int64,
+        device="cpu",
+    )
 
 
 def _uniform_topk_ids(
@@ -172,7 +177,11 @@ def _uniform_topk_ids(
     topk: int,
     permutation: torch.Tensor,
 ) -> torch.Tensor:
-    flat_indices = torch.arange(num_tokens * topk, dtype=torch.int64)
+    flat_indices = torch.arange(
+        num_tokens * topk,
+        dtype=torch.int64,
+        device="cpu",
+    )
     return permutation[flat_indices.remainder(num_experts)].view(num_tokens, topk)
 
 
@@ -183,7 +192,11 @@ def _synthetic_skew_topk_ids(
     permutation: torch.Tensor,
 ) -> torch.Tensor:
     if topk == 1 and num_experts > 1:
-        token_ids = torch.arange(num_tokens, dtype=torch.int64)
+        token_ids = torch.arange(
+            num_tokens,
+            dtype=torch.int64,
+            device="cpu",
+        )
         hot_pool_size = max(1, min(num_experts - 1, num_experts // 16))
         cold_pool_size = num_experts - hot_pool_size
         use_cold = token_ids.remainder(16).eq(0)
@@ -202,9 +215,21 @@ def _synthetic_skew_topk_ids(
     )
     cold_pool_size = num_experts - hot_pool_size
 
-    token_ids = torch.arange(num_tokens, dtype=torch.int64).unsqueeze(1)
-    hot_offsets = torch.arange(hot_slots, dtype=torch.int64).unsqueeze(0)
-    cold_offsets = torch.arange(cold_slots, dtype=torch.int64).unsqueeze(0)
+    token_ids = torch.arange(
+        num_tokens,
+        dtype=torch.int64,
+        device="cpu",
+    ).unsqueeze(1)
+    hot_offsets = torch.arange(
+        hot_slots,
+        dtype=torch.int64,
+        device="cpu",
+    ).unsqueeze(0)
+    cold_offsets = torch.arange(
+        cold_slots,
+        dtype=torch.int64,
+        device="cpu",
+    ).unsqueeze(0)
     hot_indices = (token_ids * hot_slots + hot_offsets).remainder(hot_pool_size)
     cold_indices = hot_pool_size + (
         token_ids * cold_slots + cold_offsets
