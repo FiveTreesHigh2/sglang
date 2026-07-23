@@ -64,9 +64,8 @@ def main():
     num_k_heads, num_v_heads = 16, 32
     head_k, head_v = 128, 128
     conv_width = 4
-    seq_len = 8192
     lengths = [1, 7, 63, 64, 65, 130, 257, 511, 1023, 2048, 4031]
-    assert sum(lengths) == seq_len
+    seq_len = sum(lengths)  # ~8.2k tokens, one prefill-chunk scale
 
     qkv_dim = 2 * num_k_heads * head_k + num_v_heads * head_v
     qkvz_dim = qkv_dim + num_v_heads * head_v
