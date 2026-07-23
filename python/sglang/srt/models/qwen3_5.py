@@ -28,6 +28,7 @@ from sglang.jit_kernel.triton.gdn_fused_proj import (
 
 # Layers - Attention
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
+from sglang.kernels.ops.attention.fla.layernorm_gated import layernorm_fn
 from sglang.kernels.ops.layernorm.elementwise import fused_sigmoid_mul
 
 # Configs
@@ -605,17 +606,47 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         z_shape_og = z.shape
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
 
-        # Add padding for DP-Attn
-        if core_attn_out.shape != z.shape:
-            core_attn_out_pad = torch.zeros_like(z)
-            core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
-            core_attn_out = core_attn_out_pad
+        num_h, head_d = z_shape_og[-2], z_shape_og[-1]
+        z_inner_dense = (
+            z.dim() == 3 and z.stride(-1) == 1 and z.stride(-2) == head_d
+        )
+        if (
+            z_inner_dense
+            and not z.is_contiguous()
+            and not _is_cpu
+            and not _is_npu
+            and core_attn_out.shape[0] == z_shape_og[0] * num_h
+        ):
+            # z is the strided prefill view (token stride > num_h * head_d):
+            # merging (T, H) into norm rows would silently materialize a full
+            # copy of z inside reshape. Run the norm in [T, H*D] grouped mode
+            # instead: the kernel takes stride_z_row at runtime, so it reads z
+            # in place, and per-group statistics are numerically identical to
+            # the row-wise form.
+            core_attn_out = layernorm_fn(
+                core_attn_out.reshape(z_shape_og[0], num_h * head_d),
+                self.norm.weight.repeat(num_h),
+                self.norm.bias,
+                z=z.view(z_shape_og[0], num_h * head_d),
+                eps=self.norm.eps,
+                group_size=head_d,
+                norm_before_gate=self.norm.norm_before_gate,
+                is_rms_norm=True,
+                activation=self.norm.activation,
+            )
+        else:
+            z = z.reshape(-1, z.shape[-1])
 
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+            # Add padding for DP-Attn
+            if core_attn_out.shape != z.shape:
+                core_attn_out_pad = torch.zeros_like(z)
+                core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
+                core_attn_out = core_attn_out_pad
+
+            core_attn_out = self.norm(core_attn_out, z)
+            core_attn_out = core_attn_out.reshape(z_shape_og)
+            core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
         output, _ = self.out_proj(core_attn_out)
         return output

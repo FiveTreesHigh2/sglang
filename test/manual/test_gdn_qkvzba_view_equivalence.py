@@ -10,6 +10,8 @@ view. This test asserts, on production Qwen3.5 shapes:
 3. causal_conv1d_fn(strided view) == causal_conv1d_fn(contiguous copy)
    (bitwise) and the strided-input output buffer stays channel-last dense
 4. fused_qkv_split_gdn_prefill(strided view) == (contiguous copy) (bitwise)
+5. grouped-mode gated RMSNorm on strided z ([T, H*D], group_size=D) ==
+   row-wise mode on contiguous z ([T*H, D]) (bitwise)
 
 Run: python test_gdn_qkvzba_view_equivalence.py
 """
@@ -25,12 +27,14 @@ def _import_paths():
             fused_qkv_split_gdn_prefill,
             fused_qkvzba_split_reshape_cat_contiguous,
         )
+        from sglang.kernels.ops.attention.fla.layernorm_gated import layernorm_fn
         from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_fn
     except ImportError:
         from sglang.srt.layers.attention.fla.gdn_fused_proj import (
             fused_qkv_split_gdn_prefill,
             fused_qkvzba_split_reshape_cat_contiguous,
         )
+        from sglang.srt.layers.attention.fla.layernorm_gated import layernorm_fn
         from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
             causal_conv1d_fn,
         )
@@ -38,6 +42,7 @@ def _import_paths():
         fused_qkvzba_split_reshape_cat_contiguous,
         fused_qkv_split_gdn_prefill,
         causal_conv1d_fn,
+        layernorm_fn,
     )
 
 
@@ -55,7 +60,7 @@ def _check(name, ref, new):
 
 
 def main():
-    fused_cat, fused_split, conv_fn = _import_paths()
+    fused_cat, fused_split, conv_fn, layernorm_fn = _import_paths()
     device = "cuda"
     dtype = torch.bfloat16
     torch.manual_seed(20260722)
@@ -135,6 +140,35 @@ def main():
     )
     for name, r, n in zip(("q", "k", "v"), sp_contig, sp_view):
         ok &= _check(f"fused_qkv_split {name} (strided vs contiguous)", r, n)
+
+    # ── 5. grouped zero-copy norm on strided z vs row-wise norm ──
+    T = seq_len
+    x_attn = torch.randn(T * num_v_heads, head_v, dtype=dtype, device=device)
+    norm_w = torch.randn(head_v, dtype=dtype, device=device)
+    z3d = view_z  # [T, H, D], token stride = qkvz_dim (strided)
+    ref_norm = layernorm_fn(
+        x_attn,
+        norm_w,
+        None,
+        z=z3d.reshape(-1, head_v),  # materializes contiguous copy (old path)
+        eps=1e-6,
+        group_size=None,
+        norm_before_gate=True,
+        is_rms_norm=True,
+        activation="swish",
+    ).reshape(T, num_v_heads * head_v)
+    new_norm = layernorm_fn(
+        x_attn.reshape(T, num_v_heads * head_v),
+        norm_w.repeat(num_v_heads),
+        None,
+        z=z3d.view(T, num_v_heads * head_v),  # zero-copy strided view
+        eps=1e-6,
+        group_size=head_v,
+        norm_before_gate=True,
+        is_rms_norm=True,
+        activation="swish",
+    )
+    ok &= _check("gated RMSNorm (grouped strided-z vs row-wise)", ref_norm, new_norm)
 
     if not ok:
         print("\nqkvzba view shortcut: NOT equivalent")
