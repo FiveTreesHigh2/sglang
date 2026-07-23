@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import os
 from typing import Optional
 
 import torch
@@ -12,6 +13,12 @@ import triton.language as tl
 from sglang.kernels.ops.attention.fla.utils import input_guard
 
 BT_LIST = [8, 16, 32, 64, 128]
+
+# Single pinned config (autotune below is kept disabled); env knobs allow
+# model/hardware-local tile validation, mirroring chunk_delta_h.py.
+GDN_L2NORM_BT = int(os.getenv("SGLANG_GDN_L2NORM_BT", "16"))
+GDN_L2NORM_NUM_WARPS = int(os.getenv("SGLANG_GDN_L2NORM_NUM_WARPS", "8"))
+GDN_L2NORM_NUM_STAGES = int(os.getenv("SGLANG_GDN_L2NORM_NUM_STAGES", "3"))
 
 
 # @triton.autotune(
@@ -104,9 +111,9 @@ def l2norm_fwd(
             T=T,
             D=D,
             BD=BD,
-            BT=16,
-            num_warps=8,
-            num_stages=3,
+            BT=GDN_L2NORM_BT,
+            num_warps=GDN_L2NORM_NUM_WARPS,
+            num_stages=GDN_L2NORM_NUM_STAGES,
         )
     else:
         l2norm_fwd_kernel1[(T,)](

@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import os
 from typing import Optional
 
 import torch
@@ -14,6 +15,13 @@ from sglang.kernels.ops.attention.fla.utils import check_shared_mem, is_nvidia_h
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
+
+# Single pinned config (autotune below is kept disabled); env knobs allow
+# model/hardware-local tile validation, mirroring chunk_delta_h.py.
+GDN_CHUNK_O_BK = int(os.getenv("SGLANG_GDN_CHUNK_O_BK", "128"))
+GDN_CHUNK_O_BV = int(os.getenv("SGLANG_GDN_CHUNK_O_BV", "64"))
+GDN_CHUNK_O_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_O_NUM_WARPS", "4"))
+GDN_CHUNK_O_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_O_NUM_STAGES", "2"))
 
 
 # @triton.autotune(
@@ -164,11 +172,11 @@ def chunk_fwd_o(
         K=K,
         V=V,
         BT=BT,
-        BK=128,
-        BV=64,
+        BK=GDN_CHUNK_O_BK,
+        BV=GDN_CHUNK_O_BV,
         USE_G=g is not None,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
-        num_stages=2,
+        num_warps=GDN_CHUNK_O_NUM_WARPS,
+        num_stages=GDN_CHUNK_O_NUM_STAGES,
     )
     return o

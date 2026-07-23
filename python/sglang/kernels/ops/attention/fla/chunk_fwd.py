@@ -31,7 +31,7 @@ else:
     configs=[
         triton.Config({"BK": BK}, num_warps=num_warps)
         for BK in [32, 64]
-        for num_warps in [1, 2, 4]
+        for num_warps in [1, 2, 4, 8]
     ],
     key=["H", "Hg", "K", "BC"],
     **autotune_cache_kwargs,
