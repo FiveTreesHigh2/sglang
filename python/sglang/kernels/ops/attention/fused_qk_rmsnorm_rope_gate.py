@@ -56,6 +56,7 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     FP16: tl.constexpr,
     HAS_PASS: tl.constexpr,
     HAS_GATE: tl.constexpr,
+    WRITE_GATE: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
     token = tl.program_id(0)
@@ -115,8 +116,9 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     tl.store(out_base + rot_offs, (xr1 * cos - xr2 * sin), mask=rot_mask)
     tl.store(out_base + HALF_ROTARY + rot_offs, (xr2 * cos + xr1 * sin), mask=rot_mask)
 
-    # Gate copy (Q heads only)
-    if HAS_GATE and not is_k:
+    # Gate copy (Q heads only). Skipped when the caller consumes the gate as
+    # a strided view of q_gate instead (saves a full gate read + write).
+    if HAS_GATE and WRITE_GATE and not is_k:
         gate_in = in_base + HEAD_DIM
         gate_out = gate_out_ptr + token * stride_gate_t + local_head * HEAD_DIM
         g = tl.load(gate_in + head_offs, mask=head_mask, other=0.0)
@@ -141,6 +143,7 @@ def fused_qk_gemma_rmsnorm_rope_gate(
     head_dim: int,
     rotary_dim: int,
     has_gate: bool = True,
+    materialize_gate: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Fused QK GemmaRMSNorm + NeoX RoPE + gate deinterleave.
 
@@ -150,6 +153,9 @@ def fused_qk_gemma_rmsnorm_rope_gate(
         q_weight, k_weight: [head_dim] — raw GemmaRMSNorm weights (kernel adds +1.0)
         cos_sin_cache: [max_seq_len, rotary_dim] — [cos..., sin...]
         positions: [T] — token positions
+        materialize_gate: if False, skip the in-kernel gate copy and return the
+            gate as a [T, num_q_heads, head_dim] strided view of q_gate
+            (consumers like fused_sigmoid_mul read it via explicit strides).
     """
     T = q_gate.shape[0]
     q_size = num_q_heads * head_dim
@@ -157,9 +163,10 @@ def fused_qk_gemma_rmsnorm_rope_gate(
 
     q_out = torch.empty(T, q_size, dtype=q_gate.dtype, device=q_gate.device)
     k_out = torch.empty(T, kv_size, dtype=k.dtype, device=k.device)
+    write_gate = has_gate and materialize_gate
     gate_out = (
         torch.empty(T, num_q_heads, head_dim, dtype=q_gate.dtype, device=q_gate.device)
-        if has_gate
+        if write_gate
         else q_out
     )
 
@@ -195,7 +202,14 @@ def fused_qk_gemma_rmsnorm_rope_gate(
         FP16=q_gate.dtype == torch.float16,
         HAS_PASS=rotary_dim < head_dim,
         HAS_GATE=has_gate,
+        WRITE_GATE=write_gate,
         ENABLE_PDL=_ENABLE_PDL,
     )
 
-    return q_out, k_out, gate_out if has_gate else None
+    if not has_gate:
+        return q_out, k_out, None
+    if not materialize_gate:
+        # [T, num_q_heads, head_dim] strided view into the interleaved q_gate.
+        gate_view = q_gate.unflatten(-1, (num_q_heads, 2, head_dim))[:, :, 1, :]
+        return q_out, k_out, gate_view
+    return q_out, k_out, gate_out

@@ -998,11 +998,15 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.head_dim,
             self.rotary_emb.rotary_dim,
             has_gate=self.attn_output_gate,
+            materialize_gate=False,
         )
         seq_len = hidden_states.shape[0]
         q = q_out.view(seq_len, -1)
         k = k_out.view(seq_len, -1)
-        gate = gate_out.view(seq_len, -1) if gate_out is not None else None
+        # gate stays a [T, num_heads, head_dim] strided view into q_gate;
+        # fused_sigmoid_mul reads it via explicit strides (same contract as
+        # the native path), saving the in-kernel gate read + write.
+        gate = gate_out
         return q, k, v, gate
 
     def forward_prepare_native(self, positions, hidden_states):
