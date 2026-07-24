@@ -1,3 +1,4 @@
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -35,6 +36,10 @@ if is_cuda() or is_hip():
     )
 
 MAX_FUSED_QKV_SPLIT_DIM = 8192
+
+# Runtime switch for the prefill qkv-split view shortcut (action B). Read at
+# import time; used for controlled A/B captures under identical thermal state.
+GDN_QKV_VIEW_ENABLED = os.getenv("SGLANG_GDN_QKV_VIEW", "1") == "1"
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -549,7 +554,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
         qk_view = (
-            is_cuda()
+            GDN_QKV_VIEW_ENABLED
+            and is_cuda()
             and not is_target_verify
             and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
             and mixed_qkv.stride(-1) == 1

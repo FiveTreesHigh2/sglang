@@ -31,7 +31,11 @@ else:
     configs=[
         triton.Config({"BK": BK}, num_warps=num_warps)
         for BK in [32, 64]
-        for num_warps in [1, 2, 4, 8]
+        # w8 was evaluated on SM120 (sprint scan): no combo beat w4 (~90.5us
+        # across the board) while widening the candidate set made autotune
+        # selection unstable under load (observed 90->101us regression).
+        # Keep the original candidate list.
+        for num_warps in [1, 2, 4]
     ],
     key=["H", "Hg", "K", "BC"],
     **autotune_cache_kwargs,
