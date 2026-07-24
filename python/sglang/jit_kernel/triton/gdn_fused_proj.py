@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
+
+# Launch config for the v-extraction copy kernel. The kernel is a pure
+# bandwidth-bound row copy (no loop, so num_stages is irrelevant and omitted);
+# the default mirrors the upstream fused_qkv_split_gdn_prefill config
+# (#26206), which measures at ~1.26TB/s effective bandwidth on SM120.
+GDN_EXTRACT_V_NUM_WARPS = int(os.getenv("SGLANG_GDN_EXTRACT_V_NUM_WARPS", "8"))
 
 # =============================================================================
 # Fused kernel — reads INTERLEAVED input format
@@ -397,8 +405,7 @@ def extract_v_gdn_prefill(
         COL_OFFSET=col_offset,
         NUM_COLS=v_dim,
         BLOCK_SIZE=triton.next_power_of_2(v_dim),
-        num_warps=8,
-        num_stages=3,
+        num_warps=GDN_EXTRACT_V_NUM_WARPS,
     )
     return v
 
