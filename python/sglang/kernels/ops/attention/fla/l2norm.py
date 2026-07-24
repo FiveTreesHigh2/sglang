@@ -78,6 +78,36 @@ def l2norm_fwd_kernel(
     tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
 
 
+@triton.jit
+def l2norm_fwd_kernel_strided(
+    x,
+    y,
+    eps,
+    stride_x_row,
+    R,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    BT: tl.constexpr,
+    BD: tl.constexpr,
+):
+    # Rows are (token, head) pairs living inside a wider packed matrix:
+    # row r reads x + (r // H) * stride_x_row + (r % H) * D. Per-row math is
+    # identical to l2norm_fwd_kernel, so outputs match bitwise.
+    i_t = tl.program_id(0)
+    rows = i_t * BT + tl.arange(0, BT)
+    row_mask = rows < R
+    tok = rows // H
+    head = rows % H
+    cols = tl.arange(0, BD)
+    mask = row_mask[:, None] & (cols < D)[None, :]
+    p_x = x + tok[:, None] * stride_x_row + head[:, None] * D + cols[None, :]
+    b_x = tl.load(p_x, mask=mask, other=0.0).to(tl.float32)
+    b_var = tl.sum(b_x * b_x, axis=1)
+    b_y = b_x / tl.sqrt(b_var + eps)[:, None]
+    p_y = y + rows[:, None] * D + cols[None, :]
+    tl.store(p_y, b_y.to(y.dtype.element_ty), mask=mask)
+
+
 def l2norm_fwd(
     x: torch.Tensor, eps: float = 1e-6, output_dtype: Optional[torch.dtype] = None
 ):
@@ -127,6 +157,38 @@ def l2norm_fwd(
         )
 
     return y.view(x_shape_og)
+
+
+def l2norm_fwd_packed(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """L2-normalize (token, head) rows read in place from a packed qkv matrix.
+
+    ``x`` is a [T, H, D] view into a wider packed row (token stride larger
+    than H*D, head/dim contiguous), e.g. the q or k columns of the GDN conv
+    output. Returns a dense [1, T, H, D] tensor. Per-row math matches
+    l2norm_fwd bitwise, so it can substitute the in-kernel qk l2norm.
+    """
+    if x.ndim != 3 or x.stride(2) != 1 or x.stride(1) != x.shape[2]:
+        raise ValueError("x must be a [T, H, D] view with dense inner dims")
+    T, H, D = x.shape
+    R = T * H
+    y = torch.empty(1, T, H, D, dtype=x.dtype, device=x.device)
+    BD = triton.next_power_of_2(D)
+    if D > BD or BD > 512:
+        raise ValueError("head dim too large for the packed l2norm kernel")
+    l2norm_fwd_kernel_strided[(triton.cdiv(R, GDN_L2NORM_BT),)](
+        x,
+        y,
+        eps,
+        x.stride(0),
+        R,
+        H=H,
+        D=D,
+        BT=GDN_L2NORM_BT,
+        BD=BD,
+        num_warps=GDN_L2NORM_NUM_WARPS,
+        num_stages=GDN_L2NORM_NUM_STAGES,
+    )
+    return y
 
 
 class L2NormFunction(torch.autograd.Function):

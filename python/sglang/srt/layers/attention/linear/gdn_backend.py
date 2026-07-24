@@ -3,6 +3,7 @@ from typing import Optional, Tuple, Union
 import torch
 
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
+from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd_packed
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -544,7 +545,35 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        if (is_cuda() or is_hip()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+        qk_view = (
+            is_cuda()
+            and not is_target_verify
+            and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
+            and mixed_qkv.stride(-1) == 1
+            and mixed_qkv.shape[-1] == qkv_dim
+        )
+        if qk_view:
+            # Prefill shortcut: q/k are l2-normalized straight out of the
+            # packed conv output via strided views, replacing both the q/k
+            # copies in the fused split and the in-kernel l2norm pass
+            # (qk_l2norm_applied below). v stays materialized because the
+            # FLA chunk kernels assume dense [1, T, H, V] inputs.
+            query = l2norm_fwd_packed(
+                mixed_qkv[:, : layer.q_dim].unflatten(
+                    -1, (layer.num_q_heads, layer.head_q_dim)
+                )
+            )
+            key = l2norm_fwd_packed(
+                mixed_qkv[:, layer.q_dim : layer.q_dim + layer.k_dim].unflatten(
+                    -1, (layer.num_k_heads, layer.head_k_dim)
+                )
+            )
+            value = (
+                mixed_qkv[:, layer.q_dim + layer.k_dim :]
+                .contiguous()
+                .view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+            )
+        elif (is_cuda() or is_hip()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
             query, key, value = fused_qkv_split_gdn_prefill(
                 mixed_qkv,
                 layer.num_q_heads,
@@ -592,6 +621,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states_contig,
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
+                qk_l2norm_applied=qk_view,
             )
 
             if is_npu() and last_recurrent_state is not None:
