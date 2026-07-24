@@ -20,7 +20,10 @@ import torch
 
 def _import_paths():
     try:
-        from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkv_split_gdn_prefill
+        from sglang.jit_kernel.triton.gdn_fused_proj import (
+            extract_v_gdn_prefill,
+            fused_qkv_split_gdn_prefill,
+        )
         from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
         from sglang.kernels.ops.attention.fla.l2norm import (
             l2norm_fwd,
@@ -28,6 +31,7 @@ def _import_paths():
         )
     except ImportError:
         from sglang.srt.layers.attention.fla.gdn_fused_proj import (
+            extract_v_gdn_prefill,
             fused_qkv_split_gdn_prefill,
         )
         from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
@@ -35,7 +39,13 @@ def _import_paths():
             l2norm_fwd,
             l2norm_fwd_packed,
         )
-    return fused_qkv_split_gdn_prefill, chunk_gated_delta_rule, l2norm_fwd, l2norm_fwd_packed
+    return (
+        fused_qkv_split_gdn_prefill,
+        extract_v_gdn_prefill,
+        chunk_gated_delta_rule,
+        l2norm_fwd,
+        l2norm_fwd_packed,
+    )
 
 
 def _check(name, ref, new):
@@ -52,7 +62,7 @@ def _check(name, ref, new):
 
 
 def main():
-    fused_split, chunk_rule, l2norm_fwd, l2norm_fwd_packed = _import_paths()
+    fused_split, extract_v, chunk_rule, l2norm_fwd, l2norm_fwd_packed = _import_paths()
     device = "cuda"
     dtype = torch.bfloat16
     torch.manual_seed(20260724)
@@ -85,13 +95,9 @@ def main():
     ok &= _check("q l2norm (packed view vs dense)", l2norm_fwd(q_old), q_new)
     ok &= _check("k l2norm (packed view vs dense)", l2norm_fwd(k_old), k_new)
 
-    # ── 2. v extraction ──
-    v_new = (
-        mixed_qkv[:, q_dim + k_dim :]
-        .contiguous()
-        .view(1, T, num_v_heads, head_dim)
-    )
-    ok &= _check("v (slice contiguous vs fused split)", v_old, v_new)
+    # ── 2. v extraction (dedicated Triton kernel vs fused split) ──
+    v_new = extract_v(mixed_qkv, q_dim + k_dim, num_v_heads, head_dim)
+    ok &= _check("v (extract kernel vs fused split)", v_old, v_new)
 
     # ── 3. end-to-end chunk_gated_delta_rule ──
     cu = torch.zeros(len(lengths) + 1, dtype=torch.long, device=device)

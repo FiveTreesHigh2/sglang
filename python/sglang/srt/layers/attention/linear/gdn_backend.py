@@ -29,7 +29,10 @@ if not is_cpu():
     )
 
 if is_cuda() or is_hip():
-    from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkv_split_gdn_prefill
+    from sglang.jit_kernel.triton.gdn_fused_proj import (
+        extract_v_gdn_prefill,
+        fused_qkv_split_gdn_prefill,
+    )
 
 MAX_FUSED_QKV_SPLIT_DIM = 8192
 
@@ -568,10 +571,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     -1, (layer.num_k_heads, layer.head_k_dim)
                 )
             )
-            value = (
-                mixed_qkv[:, layer.q_dim + layer.k_dim :]
-                .contiguous()
-                .view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+            value = extract_v_gdn_prefill(
+                mixed_qkv,
+                layer.q_dim + layer.k_dim,
+                layer.num_v_heads,
+                layer.head_v_dim,
             )
         elif (is_cuda() or is_hip()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
             query, key, value = fused_qkv_split_gdn_prefill(

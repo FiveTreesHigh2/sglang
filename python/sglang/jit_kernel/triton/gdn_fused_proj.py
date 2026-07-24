@@ -353,6 +353,56 @@ def fused_qkv_split_gdn_prefill_kernel(
     tl.store(v + i_t * v_dim + v_offsets, values, mask=v_mask)
 
 
+@triton.jit
+def _extract_columns_kernel(
+    dst,
+    src,
+    SRC_STRIDE_T: tl.constexpr,
+    COL_OFFSET: tl.constexpr,
+    NUM_COLS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Copies dst[t, :] = src[t, COL_OFFSET : COL_OFFSET + NUM_COLS] with
+    # vector-width loads; replaces the generic aten slice copy whose
+    # effective bandwidth trails on this access pattern.
+    i_t = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < NUM_COLS
+    vals = tl.load(src + i_t * SRC_STRIDE_T + COL_OFFSET + offs, mask=mask)
+    tl.store(dst + i_t * NUM_COLS + offs, vals, mask=mask)
+
+
+def extract_v_gdn_prefill(
+    mixed_qkv: torch.Tensor,
+    col_offset: int,
+    num_v_heads: int,
+    head_v: int,
+) -> torch.Tensor:
+    """Extract the dense v tensor from packed [T, qkv_dim] conv output.
+
+    Returns [1, T, num_v_heads, head_v]; the q/k columns stay untouched for
+    the strided-view consumers.
+    """
+    seq_len = mixed_qkv.shape[0]
+    v_dim = num_v_heads * head_v
+    v = torch.empty(
+        (1, seq_len, num_v_heads, head_v),
+        dtype=mixed_qkv.dtype,
+        device=mixed_qkv.device,
+    )
+    _extract_columns_kernel[(seq_len,)](
+        v,
+        mixed_qkv,
+        SRC_STRIDE_T=mixed_qkv.stride(0),
+        COL_OFFSET=col_offset,
+        NUM_COLS=v_dim,
+        BLOCK_SIZE=triton.next_power_of_2(v_dim),
+        num_warps=8,
+        num_stages=3,
+    )
+    return v
+
+
 def fused_qkv_split_gdn_prefill(
     mixed_qkv: torch.Tensor,
     num_q_heads: int,
