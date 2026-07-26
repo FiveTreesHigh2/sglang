@@ -709,3 +709,58 @@ def test_cli_accepts_staged_search_runtime_controls() -> None:
     assert args.coarse_iters == 20
     assert args.stable_iters == 100
     assert args.max_configs == 8
+
+
+def test_joint_selection_uses_one_block_m_and_minimizes_total_latency() -> None:
+    utils = load_down_tuning_utils()
+
+    def record(operation, block_m, latency):
+        config = {
+            "BLOCK_SIZE_M": block_m,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 16,
+            "num_warps": 4,
+            "num_stages": 3,
+        }
+        return {
+            "operation": operation,
+            "candidate": utils.candidate_key(config, operation == "down"),
+            "config": config,
+            "use_tma": operation == "down",
+            "profile": "uniform",
+            "seed": 0,
+            "median_ms": latency,
+        }
+
+    selection = utils.select_robust_joint_pair(
+        [
+            record("up", 32, 1.0),
+            record("down", 32, 1.2),
+            record("up", 64, 1.4),
+            record("down", 64, 0.7),
+        ]
+    )
+
+    assert selection["block_m"] == 64
+    assert selection["median_ms"] == pytest.approx(2.1)
+
+
+def test_cli_accepts_single_gpu_joint_tuning() -> None:
+    sep = load_sep_tuner()
+
+    args = sep.parse_args(
+        [
+            "--kernel",
+            "joint",
+            "--tune",
+            "--batch-sizes",
+            "1",
+            "8192",
+            "--output-dir",
+            "/tmp/joint",
+        ]
+    )
+
+    assert args.kernel == "joint"
+    assert args.output_dir == "/tmp/joint"
