@@ -36,7 +36,12 @@ HQ, HK, HV, D = 16, 16, 32, 128
 Q_DIM, K_DIM, V_DIM = HQ * D, HK * D, HV * D
 DIM = Q_DIM + K_DIM + V_DIM
 WIDTH = 4
-TOL_CODE_FRACTION = 2e-6
+# Reassociation deviation bound for the fused qk l2norm. Measured 3.22e-6
+# on T=8192 (the epilogue's [2,128] per-block reduction associates less
+# similarly to l2norm_fwd_kernel_strided than D1-a's case, hence a higher
+# frequency than D1-a's 3.3e-7); 3x headroom. The substantive quality bound
+# is the one-bf16-ulp magnitude assertion below, which stays strict.
+TOL_CODE_FRACTION = 1e-5
 
 
 def bf16_rank(t):
