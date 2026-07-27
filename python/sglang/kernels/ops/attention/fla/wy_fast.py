@@ -69,6 +69,14 @@ def recompute_w_u_fwd_kernel(
     )
     b_beta = tl.load(p_beta, boundary_check=(0,))
     b_A = tl.load(p_A, boundary_check=(0, 1))
+    # A is allocated with torch.empty: the kkt+solve producer only stores the
+    # lower-triangular BC-blocks, so mask the (garbage) upper triangle to the
+    # zeros the old zeros-init provided. Cast back so tl.dot sees the same
+    # element type as before (bitwise-preserving).
+    o_t = tl.arange(0, BT)
+    b_A = tl.where(o_t[:, None] >= o_t[None, :], b_A, 0.0).to(
+        p_A.dtype.element_ty
+    )
     b_g = tl.exp(tl.load(p_g, boundary_check=(0,)))
 
     for i_v in range(tl.cdiv(V, BV)):

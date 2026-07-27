@@ -391,7 +391,12 @@ def chunk_gated_delta_rule_fwd_intra(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     # Step 1: fused kkt + solve_tril
-    A = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
+    # The kkt+solve kernel writes only the 10 lower-triangular BC-blocks of
+    # each BT x BT tile; the 6 upper blocks are never stored. The sole
+    # consumer (recompute_w_u_fwd_kernel) applies a causal mask after its
+    # full-tile load, so no zero-init is needed (torch.zeros cost a hidden
+    # 33.55 MB fill per layer, ~1.0 GB/forward across 30 GDN layers).
+    A = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
     chunk_gated_delta_rule_fwd_kkt_solve_kernel[(NT, B * H)](
         k=k,
         g=g,
