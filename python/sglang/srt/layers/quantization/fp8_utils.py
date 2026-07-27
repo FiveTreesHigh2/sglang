@@ -619,6 +619,7 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
+    weight_scale_mn: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     assert input_scale is None
 
@@ -635,27 +636,37 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
 
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    # TRTLLM uses the existing SGLang column-major scale layout.
-    # CUTLASS with scale_major_mode="MN" expects (k//block_k, m), so we normalize below.
-    q_input, x_scale = sglang_per_token_group_quant_fp8(
-        input_2d, block_size[1], column_major_scales=(backend == "trtllm")
-    )
     if backend == "cutlass":
         block_n, block_k = block_size
         m, k = input_2d.shape
         n = weight.shape[0]
-        expected_x_scale_shape = (k // block_k, m)
-        expected_weight_scale_shape = (k // block_k, n // block_n)
-        if x_scale.shape == (m, k // block_k):
-            x_scale = x_scale.transpose(-1, -2).contiguous()
-        if weight_scale.shape == (n // block_n, k // block_k):
+        # Quantize straight into the CUTLASS scale_major_mode="MN" contract:
+        # the row-padded quant writes column-major A scales (storage already
+        # (k//block_k, m_pad) contiguous, consumed below as a zero-copy
+        # transpose view) and pads m to a multiple of 4, which the SM120
+        # kernel requires. Padded rows are zero-filled so the sliced output
+        # stays bit-exact. This removes the per-call x_scale transpose+copy
+        # of the previous row-major quant -> transpose().contiguous() chain.
+        q_input, x_scale = sglang_per_token_group_quant_fp8_row_padded(
+            input_2d, block_k
+        )
+        m_pad = q_input.shape[0]
+        x_scale = x_scale.transpose(-1, -2)
+        if weight_scale_mn is not None:
+            # Constant weight scale pre-transposed once at weight-load time
+            # (see Fp8LinearMethod.process_weights_after_loading_block_quant);
+            # avoids a transpose+copy per GEMM call.
+            weight_scale = weight_scale_mn
+        elif weight_scale.shape == (n // block_n, k // block_k):
             weight_scale = weight_scale.transpose(-1, -2).contiguous()
+        expected_x_scale_shape = (k // block_k, m_pad)
+        expected_weight_scale_shape = (k // block_k, n // block_n)
         assert x_scale.shape == expected_x_scale_shape, (
             "FlashInfer CUTLASS groupwise FP8 expects A scale layout "
-            f"(k//block_k, m) for scale_major_mode='MN', got {tuple(x_scale.shape)}; "
+            f"(k//block_k, m_pad) for scale_major_mode='MN', got {tuple(x_scale.shape)}; "
             f"expected {expected_x_scale_shape}. "
             f"strides={x_scale.stride()} is_contiguous={x_scale.is_contiguous()} "
-            f"m={m} n={n} k={k} block_size={block_size}"
+            f"m={m} m_pad={m_pad} n={n} k={k} block_size={block_size}"
         )
         assert weight_scale.shape == expected_weight_scale_shape, (
             "FlashInfer CUTLASS groupwise FP8 expects B scale layout "
@@ -672,17 +683,30 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
             "FlashInfer CUTLASS groupwise FP8 expects weight_scale dtype float32, "
             f"got {weight_scale.dtype}."
         )
-    # TRTLLM path continues using the original quantized scale layout.
-    output = gemm_fp8_nt_groupwise(
-        q_input,
-        weight,
-        x_scale,
-        weight_scale,
-        out_dtype=input_2d.dtype,
-    )
+        output = gemm_fp8_nt_groupwise(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            out_dtype=input_2d.dtype,
+        )
+        if m_pad != m:
+            output = output[:m]
+    else:
+        # TRTLLM consumes the SGLang column-major scale layout natively.
+        q_input, x_scale = sglang_per_token_group_quant_fp8(
+            input_2d, block_size[1], column_major_scales=True
+        )
+        output = gemm_fp8_nt_groupwise(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            out_dtype=input_2d.dtype,
+        )
 
     if bias is not None:
-        output += bias
+        output = output + bias
 
     return output.to(dtype=input_2d.dtype).view(*output_shape)
 

@@ -60,6 +60,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     deepgemm_w8a8_block_fp8_linear_with_fallback,
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
+    flashinfer_gemm_w8a8_block_fp8_linear_with_fallback,
     get_fp8_gemm_runner_backend,
     input_to_float8,
     mxfp8_group_quantize,
@@ -665,6 +666,20 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.weight_scale_inv.data = weight_scale.data
 
         if (
+            self.w8a8_block_fp8_linear
+            is flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
+        ):
+            # Pre-transpose the constant block scale into the CUTLASS
+            # scale_major_mode="MN" layout once at load time; the per-call
+            # transpose+copy in the GEMM wrapper is skipped when this
+            # attribute is present (TRTLLM ignores it and keeps the
+            # original layout).
+            layer.weight_scale_inv_fi = torch.nn.Parameter(
+                layer.weight_scale_inv.data.transpose(-1, -2).contiguous(),
+                requires_grad=False,
+            )
+
+        if (
             _use_aiter_bpreshuffle_gfx95
             and self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
         ):
@@ -891,6 +906,18 @@ class Fp8LinearMethod(LinearMethodBase):
             # Activations not quantized for marlin.
             del layer.input_scale
 
+    def _block_fp8_extra_kwargs(self, layer: torch.nn.Module) -> dict:
+        """Backend-specific extras for w8a8_block_fp8_linear.
+
+        Only the flashinfer groupwise wrapper accepts weight_scale_mn (the
+        load-time pre-transposed MN-major scale); other backends must not
+        receive unknown kwargs.
+        """
+        weight_scale_mn = getattr(layer, "weight_scale_inv_fi", None)
+        if weight_scale_mn is not None:
+            return {"weight_scale_mn": weight_scale_mn}
+        return {}
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -973,6 +1000,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale=layer.weight_scale_inv,
                     input_scale=x[1],
                     bias=bias,
+                    **self._block_fp8_extra_kwargs(layer),
                 )
 
             return self.w8a8_block_fp8_linear(
@@ -982,6 +1010,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_scale=layer.weight_scale_inv,
                 input_scale=None,
                 bias=bias,
+                **self._block_fp8_extra_kwargs(layer),
             )
 
         return apply_fp8_linear(
