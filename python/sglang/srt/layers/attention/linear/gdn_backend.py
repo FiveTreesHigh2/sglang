@@ -4,9 +4,11 @@ from typing import Optional, Tuple, Union
 import torch
 
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
-from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd_packed
+from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd, l2norm_fwd_packed
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+    QKV_SPLIT_BLOCK_N,
     causal_conv1d_fn,
+    causal_conv1d_fn_qkv_split,
     causal_conv1d_update,
 )
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
@@ -40,6 +42,15 @@ MAX_FUSED_QKV_SPLIT_DIM = 8192
 # Runtime switch for the prefill qkv-split view shortcut (action B). Read at
 # import time; used for controlled A/B captures under identical thermal state.
 GDN_QKV_VIEW_ENABLED = os.getenv("SGLANG_GDN_QKV_VIEW", "1") == "1"
+
+# GDN1: fuse the qkv split (and optionally the qk l2norm) into the prefill
+# conv epilogue, skipping the packed transit buffer entirely.
+#   off  - legacy pipeline (conv -> transit -> l2norm/extract)
+#   v    - v routed directly to its dense tensor (bitwise-exact), q/k keep
+#          the external l2norm kernels
+#   full - q/k also l2-normalized inside the conv epilogue (quantitative
+#          acceptance standard, same class as D1-a)
+GDN_CONV_FUSION = os.getenv("SGLANG_GDN_CONV_FUSION", "full")
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -475,6 +486,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
+        conv_fusion_active = False
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
             intermediate_state_cache = mamba_cache_params.intermediate_ssm
@@ -539,69 +551,123 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     mixed_qkv_to_track
                 )
 
-            mixed_qkv = causal_conv1d_fn(
-                mixed_qkv,
-                layer.conv_weights,
-                layer.bias,
-                activation=layer.activation,
-                conv_states=conv_states_contig,
-                has_initial_state=has_initial_states,
-                cache_indices=state_cache_indices,
-                query_start_loc=query_start_loc,
-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            ).transpose(0, 1)[:seq_len]
+            conv_fusion = GDN_CONV_FUSION
+            if conv_fusion not in ("v", "full") or not (
+                is_cuda()
+                and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
+                and layer.head_q_dim == layer.head_k_dim
+                and layer.q_dim % QKV_SPLIT_BLOCK_N == 0
+                and layer.k_dim % QKV_SPLIT_BLOCK_N == 0
+                and layer.v_dim % QKV_SPLIT_BLOCK_N == 0
+                and QKV_SPLIT_BLOCK_N % layer.head_q_dim == 0
+            ):
+                conv_fusion = "off"
 
-        actual_seq_len = mixed_qkv.shape[0]
-        qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        qk_view = (
-            GDN_QKV_VIEW_ENABLED
-            and is_cuda()
-            and not is_target_verify
-            and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
-            and mixed_qkv.stride(-1) == 1
-            and mixed_qkv.shape[-1] == qkv_dim
-        )
-        if qk_view:
-            # Prefill shortcut: q/k are l2-normalized straight out of the
-            # packed conv output via strided views, replacing both the q/k
-            # copies in the fused split and the in-kernel l2norm pass
-            # (qk_l2norm_applied below). v stays materialized because the
-            # FLA chunk kernels assume dense [1, T, H, V] inputs.
-            query = l2norm_fwd_packed(
-                mixed_qkv[:, : layer.q_dim].unflatten(
-                    -1, (layer.num_q_heads, layer.head_q_dim)
+            if conv_fusion != "off":
+                # GDN1: the conv epilogue writes dense q/k/v directly; the
+                # packed transit buffer and the downstream l2norm/extract_v
+                # kernels are skipped. v is bitwise-identical to the legacy
+                # path by construction; q/k are bitwise in "v" mode and
+                # carry the bounded reassociation deviation in "full" mode.
+                query, key, value = causal_conv1d_fn_qkv_split(
+                    mixed_qkv,
+                    layer.conv_weights,
+                    layer.bias,
+                    conv_states=conv_states_contig,
+                    query_start_loc=query_start_loc,
+                    seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                    num_q_heads=layer.num_q_heads,
+                    num_k_heads=layer.num_k_heads,
+                    num_v_heads=layer.num_v_heads,
+                    head_qk_dim=layer.head_q_dim,
+                    head_v_dim=layer.head_v_dim,
+                    cache_indices=state_cache_indices,
+                    has_initial_state=has_initial_states,
+                    activation=layer.activation,
+                    qk_l2norm=(conv_fusion == "full"),
                 )
-            )
-            key = l2norm_fwd_packed(
-                mixed_qkv[:, layer.q_dim : layer.q_dim + layer.k_dim].unflatten(
-                    -1, (layer.num_k_heads, layer.head_k_dim)
-                )
-            )
-            value = extract_v_gdn_prefill(
-                mixed_qkv,
-                layer.q_dim + layer.k_dim,
-                layer.num_v_heads,
-                layer.head_v_dim,
-            )
-        elif (is_cuda() or is_hip()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
-            query, key, value = fused_qkv_split_gdn_prefill(
-                mixed_qkv,
-                layer.num_q_heads,
-                layer.num_k_heads,
-                layer.num_v_heads,
-                layer.head_q_dim,
-                layer.head_k_dim,
-                layer.head_v_dim,
-            )
+                if conv_fusion == "v":
+                    # Dense l2norm on the split outputs; bitwise-identical
+                    # to the packed-view kernel (verified in action B).
+                    query = l2norm_fwd(query)
+                    key = l2norm_fwd(key)
+                conv_fusion_active = True
+            else:
+                mixed_qkv = causal_conv1d_fn(
+                    mixed_qkv,
+                    layer.conv_weights,
+                    layer.bias,
+                    activation=layer.activation,
+                    conv_states=conv_states_contig,
+                    has_initial_state=has_initial_states,
+                    cache_indices=state_cache_indices,
+                    query_start_loc=query_start_loc,
+                    seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                ).transpose(0, 1)[:seq_len]
+
+        if conv_fusion_active:
+            # q/k already l2-normalized (in-epilogue or via l2norm_fwd above).
+            qk_view = True
         else:
-            query, key, value = torch.split(
-                mixed_qkv,
-                [layer.q_dim, layer.k_dim, layer.v_dim],
-                dim=-1,
+            actual_seq_len = mixed_qkv.shape[0]
+            qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+            qk_view = (
+                GDN_QKV_VIEW_ENABLED
+                and is_cuda()
+                and not is_target_verify
+                and isinstance(
+                    self.kernel_dispatcher.extend_kernel, TritonGDNKernel
+                )
+                and mixed_qkv.stride(-1) == 1
+                and mixed_qkv.shape[-1] == qkv_dim
             )
-            query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
-            key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
-            value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+            if qk_view:
+                # Prefill shortcut: q/k are l2-normalized straight out of the
+                # packed conv output via strided views, replacing both the q/k
+                # copies in the fused split and the in-kernel l2norm pass
+                # (qk_l2norm_applied below). v stays materialized because the
+                # FLA chunk kernels assume dense [1, T, H, V] inputs.
+                query = l2norm_fwd_packed(
+                    mixed_qkv[:, : layer.q_dim].unflatten(
+                        -1, (layer.num_q_heads, layer.head_q_dim)
+                    )
+                )
+                key = l2norm_fwd_packed(
+                    mixed_qkv[:, layer.q_dim : layer.q_dim + layer.k_dim].unflatten(
+                        -1, (layer.num_k_heads, layer.head_k_dim)
+                    )
+                )
+                value = extract_v_gdn_prefill(
+                    mixed_qkv,
+                    layer.q_dim + layer.k_dim,
+                    layer.num_v_heads,
+                    layer.head_v_dim,
+                )
+            elif (is_cuda() or is_hip()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+                query, key, value = fused_qkv_split_gdn_prefill(
+                    mixed_qkv,
+                    layer.num_q_heads,
+                    layer.num_k_heads,
+                    layer.num_v_heads,
+                    layer.head_q_dim,
+                    layer.head_k_dim,
+                    layer.head_v_dim,
+                )
+            else:
+                query, key, value = torch.split(
+                    mixed_qkv,
+                    [layer.q_dim, layer.k_dim, layer.v_dim],
+                    dim=-1,
+                )
+                query = query.view(
+                    1, actual_seq_len, layer.num_q_heads, layer.head_q_dim
+                )
+                key = key.view(
+                    1, actual_seq_len, layer.num_k_heads, layer.head_k_dim
+                )
+                value = value.view(
+                    1, actual_seq_len, layer.num_v_heads, layer.head_v_dim
+                )
 
         if is_target_verify:
             core_attn_out = self.kernel_dispatcher.target_verify(

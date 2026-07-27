@@ -55,6 +55,20 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     NP2_STATELEN: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    # GDN1 fused qkv-split epilogue: route each channel block straight to
+    # its final dense q/k/v tensor (and optionally apply the per-head qk
+    # l2norm in registers) instead of materializing the packed transit
+    # buffer. Dead code when SPLIT_QKV is False (the default), so existing
+    # callers compile to the exact same kernel as before.
+    q_out_ptr=None,
+    k_out_ptr=None,
+    v_out_ptr=None,
+    l2norm_eps=0.0,
+    SPLIT_QKV: tl.constexpr = False,
+    QK_L2NORM: tl.constexpr = False,
+    Q_DIM: tl.constexpr = 0,
+    K_DIM: tl.constexpr = 0,
+    HEAD_D: tl.constexpr = 1,
 ):
     conv_states_ptr = initial_states_ptr
     conv_state_indices_ptr = cache_indices_ptr
@@ -370,13 +384,48 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         mask_1d = (idx_token < segment_len) & (
             idx_feats < dim
         )  # token-index  # feature-index
-        o_ptrs = (
-            o_ptr
-            + (sequence_start_index + token_offset + idx_token) * stride_o_token
-            + (idx_feats * stride_o_dim)
-        )
+        if SPLIT_QKV:
+            # The wrapper guarantees Q_DIM/K_DIM/V region boundaries are
+            # multiples of BLOCK_N, so this whole channel block lies inside
+            # exactly one region and feat_base decides it uniformly.
+            token_pos = (sequence_start_index + token_offset + idx_token).to(
+                tl.int64
+            )
+            feat_base = tl.program_id(2) * BLOCK_N
+            # Round to the output dtype first: this is the exact value the
+            # unfused pipeline stored to the transit buffer.
+            out_vals = acc.to(q_out_ptr.dtype.element_ty)
+            if QK_L2NORM and feat_base < Q_DIM + K_DIM:
+                # Per-head l2norm, replicating l2norm_fwd_kernel_strided on
+                # the reloaded bf16 values: var = sum(x^2) over HEAD_D,
+                # y = x / sqrt(var + eps), all in fp32.
+                xg = tl.reshape(
+                    out_vals.to(tl.float32), (BLOCK_N // HEAD_D, HEAD_D)
+                )
+                var = tl.sum(xg * xg, axis=1)
+                yg = xg / tl.sqrt(var + l2norm_eps)[:, None]
+                out_vals = tl.reshape(yg, (BLOCK_N,)).to(
+                    q_out_ptr.dtype.element_ty
+                )
+            if feat_base < Q_DIM:
+                dst = q_out_ptr + token_pos * Q_DIM + idx_feats
+            elif feat_base < Q_DIM + K_DIM:
+                dst = k_out_ptr + token_pos * K_DIM + (idx_feats - Q_DIM)
+            else:
+                dst = (
+                    v_out_ptr
+                    + token_pos * (dim - Q_DIM - K_DIM)
+                    + (idx_feats - Q_DIM - K_DIM)
+                )
+            tl.store(dst, out_vals, mask=mask_1d)
+        else:
+            o_ptrs = (
+                o_ptr
+                + (sequence_start_index + token_offset + idx_token) * stride_o_token
+                + (idx_feats * stride_o_dim)
+            )
 
-        tl.store(o_ptrs, acc, mask=mask_1d)
+            tl.store(o_ptrs, acc, mask=mask_1d)
 
 
 def causal_conv1d_fn(
@@ -563,6 +612,149 @@ def causal_conv1d_fn(
         num_stages=2,
     )
     return out
+
+
+# Channel-block width of _causal_conv1d_fwd_kernel; the qkv-split epilogue
+# requires the q/k/v region boundaries to align with it.
+QKV_SPLIT_BLOCK_N = 256
+
+
+def causal_conv1d_fn_qkv_split(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Union[torch.Tensor, None],
+    conv_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens_cpu: List[int],
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_qk_dim: int,
+    head_v_dim: int,
+    cache_indices: Optional[torch.Tensor] = None,
+    has_initial_state: Optional[torch.Tensor] = None,
+    activation: Optional[str] = "silu",
+    pad_slot_id: int = PAD_SLOT_ID,
+    qk_l2norm: bool = True,
+    l2norm_eps: float = 1e-6,
+):
+    """Prefill conv with the fused qkv-split epilogue (GDN1).
+
+    Same x/weight/state contract as causal_conv1d_fn, but the packed transit
+    output is never materialized: each channel block is stored straight into
+    its final dense q/k/v tensor. With qk_l2norm=True the epilogue also
+    applies the per-head l2 normalization (the conv result is rounded to the
+    output dtype first, replicating the unfused store-then-reload pipeline);
+    with qk_l2norm=False q/k carry the raw conv values bitwise-identical to
+    the legacy transit buffer columns. conv_states updates are untouched
+    (the kernel reads them from x only).
+
+    Returns (q [1,T,Hq,Dqk], k [1,T,Hk,Dqk], v [1,T,Hv,Dv]), all dense.
+    """
+    if isinstance(activation, bool) and activation:
+        activation = "silu"
+
+    dim, cu_seqlen = x.shape
+    q_dim = num_q_heads * head_qk_dim
+    k_dim = num_k_heads * head_qk_dim
+    v_dim = num_v_heads * head_v_dim
+    assert dim == q_dim + k_dim + v_dim
+    assert (x.stride(0) == 1) and (
+        x.stride(1) > 1
+    ), "qkv-split conv requires channel-last input"
+    assert q_dim % QKV_SPLIT_BLOCK_N == 0
+    assert k_dim % QKV_SPLIT_BLOCK_N == 0
+    assert v_dim % QKV_SPLIT_BLOCK_N == 0
+    assert QKV_SPLIT_BLOCK_N % head_qk_dim == 0
+
+    _, width = weight.shape
+    state_len = width - 1
+    np2_statelen = triton.next_power_of_2(state_len)
+
+    q = torch.empty(
+        1, cu_seqlen, num_q_heads, head_qk_dim, dtype=x.dtype, device=x.device
+    )
+    k = torch.empty(
+        1, cu_seqlen, num_k_heads, head_qk_dim, dtype=x.dtype, device=x.device
+    )
+    v = torch.empty(
+        1, cu_seqlen, num_v_heads, head_v_dim, dtype=x.dtype, device=x.device
+    )
+
+    stride_x_seq = 0
+    stride_x_dim = x.stride(0)
+    stride_x_token = x.stride(1)
+    stride_w_dim = weight.stride(0)
+    stride_w_width = weight.stride(1)
+    stride_istate_seq = 0
+    stride_istate_dim = 0
+    stride_istate_token = 0
+    num_cache_lines = 0
+    if conv_states is not None:
+        num_cache_lines = conv_states.size(0)
+        assert (
+            num_cache_lines == conv_states.shape[0]
+            and dim == conv_states.shape[1]
+            and width - 1 <= conv_states.shape[2]
+        )
+        stride_istate_seq = conv_states.stride(0)
+        stride_istate_dim = conv_states.stride(1)
+        stride_istate_token = conv_states.stride(2)
+
+    def grid(META):
+        max_seq_len = max(seq_lens_cpu)
+        return (
+            len(seq_lens_cpu),
+            (max_seq_len + META["BLOCK_M"] - 1) // META["BLOCK_M"],
+            triton.cdiv(dim, META["BLOCK_N"]),
+        )
+
+    _causal_conv1d_fwd_kernel[grid](
+        x,
+        weight,
+        bias,
+        conv_states,
+        cache_indices,
+        has_initial_state,
+        query_start_loc,
+        q,  # o_ptr placeholder; the store path is dead under SPLIT_QKV
+        dim,
+        cu_seqlen,
+        num_cache_lines,
+        stride_x_seq,
+        stride_x_dim,
+        stride_x_token,
+        stride_w_dim,
+        stride_w_width,
+        stride_istate_seq,
+        stride_istate_dim,
+        stride_istate_token,
+        0,  # stride_o_seq (unused under SPLIT_QKV)
+        0,  # stride_o_dim
+        0,  # stride_o_token
+        pad_slot_id,
+        q_out_ptr=q,
+        k_out_ptr=k,
+        v_out_ptr=v,
+        l2norm_eps=l2norm_eps,
+        HAS_BIAS=bias is not None,
+        KERNEL_WIDTH=width,
+        SILU_ACTIVATION=activation in ["silu", "swish"],
+        HAS_INITIAL_STATES=has_initial_state is not None,
+        HAS_CACHE=conv_states is not None,
+        IS_CONTINUOUS_BATCHING=cache_indices is not None,
+        USE_PAD_SLOT=pad_slot_id is not None,
+        NP2_STATELEN=np2_statelen,
+        SPLIT_QKV=True,
+        QK_L2NORM=qk_l2norm,
+        Q_DIM=q_dim,
+        K_DIM=k_dim,
+        HEAD_D=head_qk_dim,
+        BLOCK_M=8,
+        BLOCK_N=QKV_SPLIT_BLOCK_N,
+        num_stages=2,
+    )
+    return q, k, v
 
 
 # HAS_EAGLE_TREE_CUSTOM_ATTN_MASK is added to support eagle tree attention mask
