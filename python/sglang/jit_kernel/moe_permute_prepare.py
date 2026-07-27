@@ -13,14 +13,14 @@ from sglang.srt.utils.custom_op import register_custom_op
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-# Counting sort replaces torch.sort (cub radix sort, ~6 kernels and ~28us per
-# MoE layer for 64k keys with only num_experts distinct values). The atomic
-# scatter is NOT stable: ranks within an expert segment differ from the
-# radix-sorted order. Downstream this is safe: every packed row is computed
-# independently and gathered back through the same src2dst, so the final MoE
-# output is bitwise unchanged. Switch kept for controlled A/B.
+# Counting sort as an alternative to torch.sort (cub radix sort). Measured
+# on RTX PRO 5000 serving (64k routes, 256 experts): the naive global-atomic
+# implementation is a net regression (+0.63 ms/fwd vs radix: histogram 23.6us
+# per launch from 64k atomicAdds serializing on a 257-slot hot bucket array).
+# Beating cub requires smem-privatized histograms + two-level prefix sums;
+# not pursued. Default OFF, kept for future study.
 MOE_PERMUTE_COUNTING_SORT = (
-    os.getenv("SGLANG_MOE_PERMUTE_COUNTING_SORT", "1") == "1"
+    os.getenv("SGLANG_MOE_PERMUTE_COUNTING_SORT", "0") == "1"
 )
 
 
