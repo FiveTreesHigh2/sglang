@@ -115,15 +115,16 @@ Qwen3.5-35B-A3B-FP8 @ RTX PRO 5000（SM120）单卡，prefill 吞吐 +10%。
 7. **免费档第三批已判定（commits `b5b1c9b6c`~`1b9b216f1`，audit-B8M5 采集）**：
    - **B8 ✅ 生效**：chunk_fwd `A=zeros→empty` + recompute_w_u 内因果 mask；memset 18895→1980 次/窗口（**-0.55ms/fwd**，28.5μs 条目消失），w_u kernel 无回归（6.93→6.71ms）；NaN 污染法等价测试全 PASS
    - **M5 ❌ 判定失败已回退**：naive 全局原子 counting sort 净回归 +0.63ms/fwd（新路径 1.90 vs 旧 1.27ms；histogram 单次 23.6μs，64k 次 atomicAdd 在 257 槽热点上串行化）；审计 -1.2ms 定价证伪；`SGLANG_MOE_PERMUTE_COUNTING_SORT` 默认改 0，代码保留。附开发中发现并修复的别名缺陷：`.to(int32).contiguous()` 对已满足条件的张量是 no-op 返回别名，scatter 原子加原地污染了 expert_offsets（C1 断言以 new[e]==ref[e+1] 错位模式暴露）；条件性拷贝需用 `copy=True` 强制
-8. **D1-a 代码完成（commits `22a70b54a`~`907d9ec2d`+测试修订），等价性标准已裁定，待 serving 验证**：GDN gated norm 直出 fp8 喂 out_proj（估 -3.3ms）。实现：
+8. **D1-a ✅ 已验证入账（commits `22a70b54a`~`263b77cd1`，audit-D1a 采集，可归因 -2.84ms/fwd）**：GDN gated norm 直出 fp8 喂 out_proj。实现：
    - `layernorm_gated.py` 新增 `rms_norm_gated_fp8_quant`（专用 Triton kernel，不触碰共享 norm kernel）：norm 数学逐行复刻 `_layer_norm_fwd_1pass_kernel`，结果先舍入 bf16 再量化；量化 epilogue 复刻 sgl-kernel v2 kernel，含两项指令级对齐：**除法用 inline PTX `div.full.f32`**（生产 v2 kernel 以 `--use_fast_math` 构建，nvcc 将 `MAX/amax` 降为近似除法；扫描实测 div_rn 差 24937/33.5M、div.full/div.approx 均 0），转换用 inline PTX `cvt.rn.satfinite.e4m3x2.f32`；直出 (k//128, m) contiguous MN-major A scale
    - `fp8_utils.py` 解除 `assert input_scale is None`：cutlass 分支接受预量化 (fp8 codes, MN-major scale)，out_dtype 固定 bf16，m%4 垫零分支同样覆盖；trtllm 分支显式 assert 拒绝
    - `qwen3_5.py` strided-z prefill 分支接入，开关 `SGLANG_GDN_NORM_FP8_OUT`（默认 1）+ 一次性能力探测；decode 与非 strided 分支不受影响
    - **等价性标准裁定（用户选定方案 A，对本项破例）**：量化段对 CUDA v2 kernel 严格逐位（隔离验证 0/33.5M）；norm 段存在不可消除的重结合偏差——PTX 实证两 kernel 的 `tl.sum(xbar²)` 归约结构不同（参考：双链 ×8，14 FMA；融合：单链 ×16，15 FMA），由 epilogue 新增锚点（fp8 单字节存储、tl.max 第二归约）触发的 Triton 布局决策改变所致，源码层无控制手段；实测偏差 11/33.5M 码字（全部 ±1 码位）+ 1/262144 scale（1 bf16 步），与生产 norm kernel 自身的 M 依赖归约序波动（calc_rows_per_block）同类。测试改为定量断言：码字偏差率 ≤2e-6 且全部 ±1 码位；scale 偏差率 ≤2e-5 且相对偏差 ≤1%；wrapper 预量化管路对逐位一致输入严格逐位（含 m%4 垫零分支）
-   - 排查过程留档：三方对照（CUDA kernel / 独立 Triton 量化段 / torch fp32 仲裁）定位分歧段；`TRITON_CACHE_DIR` 落盘 PTX 做指令直方图（版本无关，JITFunction 缓存属性 API 不可靠）；中途两次误判（div_rn、硬件 cvt 平局行为）均由扫描数据纠正
+   - 排查过程留档：三方对照（CUDA kernel / 独立 Triton 量化段 / torch fp32 仲裁）定位分歧段；`TRITON_CACHE_DIR` 落盘 PTX 做指令直方图（版本无关，JITFunction 缓存属性 API 不可靠）；中途两次误判（div_rn、硬件 cvt 平局行为）均由扫描数据纠正；另修复 wrapper 尾部 `output.to(input_2d.dtype)` 在预量化路径下错误回转 fp8 的缺陷（`263b77cd1`，由测试 dtype 断言拦截）
+   - **serving 验证（audit-D1a，65.1 forwards）**：norm 调用 30.5→0.5 次/fwd、新 kernel 30 次/fwd（130.6μs vs 旧 168.7μs，169MB/130.6μs≈1.29TB/s 达带宽上限）、quant 162.5→132.4 次/fwd（-30 精确吻合）；可归因 norm -1.14 + quant -1.26 + FillFunctor -0.43 = **-2.84ms/fwd**；总量 223.98→**222.02ms（项目新低）**，差额为未触及类目 +0.9ms 同向漂移（已知窗口离散带内）。注意事项：nsys launch 必须含 `--cuda-graph-trace=node`，否则 BCG 图内 kernel（全部 GEMM/norm/quant/MoE）不展开，首次采集因此作废重采
 9. 待排期（中置信，M/L 工作量）：GDN1（conv1d epilogue 融合，估 -5.7ms）；D-ext 上半段 gather-A（-6.0ms，XL）——T1 失败与 M5 原子热点教训对涉及原子/scatter 的方案均是风险信号
 
-当前累计：per-forward 241.4 → 实测带 **≈223.4~224.0ms（-7.3%左右）**（audit-B-free/B3B4 两轮 223.85/223.98；B8M5 窗口 225.58 含 M5 回归 +0.63 与窗口漂移，M5 已回退，B8 的 -0.55 待下轮采集入账）；端到端待新一轮 bench 确认。距 217ms 目标尚差 ~6.5ms：候选为 D1-a（-3.3ms）+ D-ext gather-A（-6ms，XL）。生产环境变量清单（已验证）：`SGLANG_GDN_CHUNK_H_BV=64 _NUM_WARPS=4 _NUM_STAGES=2, SGLANG_GDN_WU_BK=128 _BV=128 _NUM_STAGES=3`（FUSED_A1 自 `a7e732638` 起默认开启）；`SGLANG_GDN_QKV_VIEW=1` 默认保留；`SGLANG_MOE_PERMUTE_COUNTING_SORT` 默认关闭。
+当前累计：per-forward 241.4 → **222.02ms（-8.0%，audit-D1a）**；端到端待新一轮 bench 确认（预期 ≈35500+ tok/s）。距 217ms 目标尚差 ~5ms：候选为 GDN1（conv1d epilogue 融合，估 -5.7ms，M/L）与 D-ext gather-A（-6ms，XL）。生产环境变量清单（已验证）：`SGLANG_GDN_CHUNK_H_BV=64 _NUM_WARPS=4 _NUM_STAGES=2, SGLANG_GDN_WU_BK=128 _BV=128 _NUM_STAGES=3`（FUSED_A1 自 `a7e732638` 起默认开启）；`SGLANG_GDN_QKV_VIEW=1`、`SGLANG_GDN_NORM_FP8_OUT=1` 默认保留；`SGLANG_MOE_PERMUTE_COUNTING_SORT` 默认关闭。
 
 旋钮清单（默认值=现状）：
 - chunk_o：`SGLANG_GDN_CHUNK_O_BK/_BV/_NUM_WARPS/_NUM_STAGES`（128/64/4/2）
