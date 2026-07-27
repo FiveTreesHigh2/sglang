@@ -621,10 +621,19 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
     bias: Optional[torch.Tensor] = None,
     weight_scale_mn: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    assert input_scale is None
-
     input_2d = input.view(-1, input.shape[-1])
     backend = _get_flashinfer_groupwise_backend()
+    if input_scale is not None:
+        # Pre-quantized activations from a fused quant epilogue (e.g.
+        # rms_norm_gated_fp8_quant): input carries fp8 e4m3 codes and
+        # input_scale the MN-major (k//block_k, m) fp32 A scale. Only the
+        # CUTLASS backend consumes this layout; call sites must gate on it
+        # (see Qwen3_5 GDN out_proj, audit D1-a).
+        assert backend == "cutlass", (
+            "pre-quantized input is only supported on the cutlass backend, "
+            f"got {backend}"
+        )
+        assert input_2d.dtype == torch.float8_e4m3fn
     # Fall back to triton for non-supported formats.
     # TODO: Check if flashinfer supports other output dtypes besides bf16.
     if backend == "trtllm" and (
@@ -640,17 +649,25 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
         block_n, block_k = block_size
         m, k = input_2d.shape
         n = weight.shape[0]
-        # Quantize straight into the CUTLASS scale_major_mode="MN" contract:
-        # with column_major_scales=True the A-scale storage is already
-        # (k//block_k, m) contiguous, so the transpose below is a zero-copy
-        # view. Verified bitwise-identical to the row-major quant path
-        # (the row_padded direct-op variant is NOT bitwise-identical and is
-        # deliberately not used here). This removes the per-call x_scale
-        # transpose+copy of the previous transpose().contiguous() chain.
-        q_input, x_scale = sglang_per_token_group_quant_fp8(
-            input_2d, block_k, column_major_scales=True
-        )
-        x_scale = x_scale.transpose(-1, -2)
+        if input_scale is not None:
+            # Activations already quantized upstream; the fused epilogue
+            # emits the (k//block_k, m) contiguous scale directly.
+            q_input = input_2d
+            x_scale = input_scale
+            out_dtype = torch.bfloat16
+        else:
+            # Quantize straight into the CUTLASS scale_major_mode="MN" contract:
+            # with column_major_scales=True the A-scale storage is already
+            # (k//block_k, m) contiguous, so the transpose below is a zero-copy
+            # view. Verified bitwise-identical to the row-major quant path
+            # (the row_padded direct-op variant is NOT bitwise-identical and is
+            # deliberately not used here). This removes the per-call x_scale
+            # transpose+copy of the previous transpose().contiguous() chain.
+            q_input, x_scale = sglang_per_token_group_quant_fp8(
+                input_2d, block_k, column_major_scales=True
+            )
+            x_scale = x_scale.transpose(-1, -2)
+            out_dtype = input_2d.dtype
         m_pad = (m + 3) // 4 * 4
         if m_pad != m:
             # SM120 kernel requires m to be a multiple of 4 (decode shapes
@@ -698,12 +715,13 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
             weight,
             x_scale,
             weight_scale,
-            out_dtype=input_2d.dtype,
+            out_dtype=out_dtype,
         )
         if m_pad != m:
             output = output[:m]
     else:
         # TRTLLM consumes the SGLang column-major scale layout natively.
+        assert input_scale is None
         q_input, x_scale = sglang_per_token_group_quant_fp8(
             input_2d, block_size[1], column_major_scales=True
         )

@@ -183,6 +183,104 @@ def _layer_norm_fwd_1pass_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
+# fp8 e4m3 constants for the fused gated-norm quant epilogue below; kept
+# local to avoid an import cycle with the quantization package.
+_FP8_E4M3_DTYPE = torch.float8_e4m3fn
+_FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)  # 448.0
+
+
+@triton.jit
+def _rms_norm_gated_fp8_fwd_kernel(
+    X,  # pointer to the input
+    Q,  # pointer to the fp8 output codes
+    S,  # pointer to the (ngroups, M) fp32 scale output
+    W,  # pointer to the weights
+    Z,  # pointer to the gate branch
+    stride_x_row,
+    stride_q_row,
+    stride_z_row,
+    M,  # number of rows in X
+    N: tl.constexpr,  # group size (columns per group)
+    eps,
+    FP8_MIN: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    ROWS_PER_BLOCK: tl.constexpr,
+    NORM_BEFORE_GATE: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
+):
+    # Grouped RMSNorm + gate + per-(row, group) fp8 quant epilogue. The norm
+    # math replicates _layer_norm_fwd_1pass_kernel (RMS, no bias) verbatim;
+    # the quant epilogue replicates the sgl-kernel v2 per-token-group quant:
+    # amax seeded at 1e-10, y_scale = FP8_MAX / amax (IEEE RN division),
+    # stored scale = amax * (1/FP8_MAX), clamp then RN-satfinite conversion.
+    # The y -> bf16 -> fp32 round-trip reproduces the store+reload the
+    # unfused norm-then-quant pipeline performs, keeping results bitwise.
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+
+    row_start = tl.program_id(0) * ROWS_PER_BLOCK
+    group = tl.program_id(1)
+
+    rows = row_start + tl.arange(0, ROWS_PER_BLOCK)
+    cols = tl.arange(0, BLOCK_N)
+    col_offsets = cols[None, :] + group * N
+
+    row_mask = rows[:, None] < M
+    col_mask = cols[None, :] < N
+    mask = row_mask & col_mask
+
+    X_base = X + rows[:, None] * stride_x_row + col_offsets
+    x = tl.load(X_base, mask=mask, other=0.0).to(tl.float32)
+
+    if not NORM_BEFORE_GATE:
+        Z_base = Z + rows[:, None] * stride_z_row + col_offsets
+        z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
+        if ACTIVATION == "swish" or ACTIVATION == "silu":
+            x *= z * tl.sigmoid(z)
+        elif ACTIVATION == "sigmoid":
+            x *= tl.sigmoid(z)
+
+    xbar = tl.where(mask, x, 0.0)
+    var = tl.sum(xbar * xbar, axis=1) / N
+    rstd = tl.rsqrt(var + eps)
+
+    w_offsets = cols + group * N
+    w_mask = cols < N
+    w = tl.load(W + w_offsets, mask=w_mask, other=0.0).to(tl.float32)
+
+    x_hat = x * rstd[:, None]
+    y = x_hat * w[None, :]
+
+    if NORM_BEFORE_GATE:
+        Z_base = Z + rows[:, None] * stride_z_row + col_offsets
+        z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
+        if ACTIVATION == "swish" or ACTIVATION == "silu":
+            y *= z * tl.sigmoid(z)
+        elif ACTIVATION == "sigmoid":
+            y *= tl.sigmoid(z)
+
+    # Round to bf16 exactly as the unfused pipeline's store would, then
+    # quantize the reloaded value.
+    y = y.to(tl.bfloat16).to(tl.float32)
+
+    _absmax = tl.maximum(tl.max(tl.abs(y), axis=1), 1e-10)
+    y_scale = FP8_MAX / _absmax
+    y_s = _absmax * (1.0 / FP8_MAX)
+
+    q = y * y_scale[:, None]
+    q = tl.minimum(tl.maximum(q, FP8_MIN), FP8_MAX)
+    q = q.to(Q.dtype.element_ty)
+
+    Q_base = Q + rows[:, None] * stride_q_row + col_offsets
+    tl.store(Q_base, q, mask=mask)
+    tl.store(S + group * M + rows, y_s, mask=rows < M)
+
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
 @lru_cache
 def _get_sm_count(device: torch.device) -> int:
     """Get and cache the SM count for a given device."""
@@ -299,6 +397,69 @@ def _layer_norm_fwd(
 
 if _is_npu:
     from sgl_kernel_npu.fla.layernorm_gated import layer_norm_fwd_npu as _layer_norm_fwd
+
+
+def rms_norm_gated_fp8_quant(
+    x,
+    weight,
+    z,
+    eps=1e-6,
+    group_size=None,
+    norm_before_gate=True,
+    activation: str = "swish",
+):
+    """Fused grouped RMSNorm(x) gate(z) with an fp8 per-group quant epilogue.
+
+    Returns (q, s): q is the fp8 e4m3 code tensor with x's shape and s the
+    (N//group_size, M) contiguous fp32 scale, i.e. exactly the MN-major
+    (k//block_k, m) A-scale layout the FlashInfer CUTLASS groupwise GEMM
+    consumes. Bitwise-equivalent to layernorm_fn(...) followed by
+    sglang_per_token_group_quant_fp8(column_major_scales=True): the norm
+    math mirrors _layer_norm_fwd_1pass_kernel and the quant epilogue mirrors
+    the sgl-kernel v2 kernel (see _rms_norm_gated_fp8_fwd_kernel). CUDA only;
+    requires group_size to divide both x.shape[-1] and the GEMM block_k.
+    """
+    M, N_total = x.shape
+    assert group_size is not None and N_total % group_size == 0
+    ngroups = N_total // group_size
+    assert x.stride(-1) == 1
+    assert z.shape == (M, N_total) and z.stride(-1) == 1
+    assert weight.shape == (N_total,) and weight.stride(-1) == 1
+
+    q = torch.empty((M, N_total), device=x.device, dtype=_FP8_E4M3_DTYPE)
+    s = torch.empty((ngroups, M), device=x.device, dtype=torch.float32)
+
+    MAX_FUSED_SIZE = 65536 // x.element_size()
+    BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(group_size))
+    if group_size > BLOCK_N:
+        raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+    num_warps = min(max(BLOCK_N // 256, 1), 8)
+    rows_per_block = calc_rows_per_block(M, x.device)
+    grid = (cdiv(M, rows_per_block), ngroups)
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    with device_context(x.device):
+        _rms_norm_gated_fp8_fwd_kernel[grid](
+            x,
+            q,
+            s,
+            weight,
+            z,
+            x.stride(0),
+            q.stride(0),
+            z.stride(0),
+            M,
+            group_size,
+            eps,
+            FP8_MIN=-_FP8_E4M3_MAX,
+            FP8_MAX=_FP8_E4M3_MAX,
+            BLOCK_N=BLOCK_N,
+            ROWS_PER_BLOCK=rows_per_block,
+            NORM_BEFORE_GATE=norm_before_gate,
+            ACTIVATION=activation,
+            num_warps=num_warps,
+            **pdl_kwargs,
+        )
+    return q, s
 
 
 def rms_norm_gated(

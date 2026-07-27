@@ -15,6 +15,7 @@
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
+import os
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
@@ -28,7 +29,10 @@ from sglang.jit_kernel.triton.gdn_fused_proj import (
 
 # Layers - Attention
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
-from sglang.kernels.ops.attention.fla.layernorm_gated import layernorm_fn
+from sglang.kernels.ops.attention.fla.layernorm_gated import (
+    layernorm_fn,
+    rms_norm_gated_fp8_quant,
+)
 from sglang.kernels.ops.layernorm.elementwise import fused_sigmoid_mul
 
 # Configs
@@ -132,6 +136,9 @@ _gdn_use_alt_stream = _is_cuda or (
 _qknorm_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
 )
+# Fused GDN gated-norm + fp8 quant epilogue feeding out_proj directly
+# (audit D1-a); runtime switch for controlled A/B, bitwise-verified path.
+_gdn_norm_fp8_out_enabled = os.getenv("SGLANG_GDN_NORM_FP8_OUT", "1") == "1"
 _is_amx_available = cpu_has_amx_support()
 
 cached_get_processor = lru_cache(get_processor)
@@ -527,6 +534,37 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
         return projected_states_qkvz, projected_states_ba
 
+    def _out_proj_accepts_prequant(self, head_d: int) -> bool:
+        # True when out_proj runs the FlashInfer CUTLASS block-fp8 dense GEMM
+        # whose block_k equals the gated-norm group size, so the norm kernel
+        # can emit (fp8 codes, MN-major scale) directly and skip the
+        # standalone per-token-group quant launch (audit D1-a). Resolved once
+        # per layer; every input is frozen after weight load.
+        cached = getattr(self, "_out_proj_prequant_ok", None)
+        if cached is None:
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+            from sglang.srt.layers.quantization.fp8_utils import (
+                _get_flashinfer_groupwise_backend,
+                flashinfer_gemm_w8a8_block_fp8_linear_with_fallback,
+            )
+
+            qm = getattr(self.out_proj, "quant_method", None)
+            cached = (
+                _gdn_norm_fp8_out_enabled
+                and getattr(self.out_proj, "input_is_parallel", False)
+                and isinstance(qm, Fp8LinearMethod)
+                and qm.block_quant
+                and not qm.use_marlin
+                and not qm.use_mxfp8
+                and getattr(qm, "w8a8_block_fp8_linear", None)
+                is flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
+                and qm.weight_block_size[1] == head_d
+                and _get_flashinfer_groupwise_backend() == "cutlass"
+                and self.norm.bias is None
+            )
+            self._out_proj_prequant_ok = cached
+        return cached
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -634,11 +672,31 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             ):
                 norm_weight_grouped = self.norm.weight.repeat(num_h)
                 self._norm_weight_grouped = norm_weight_grouped
+            x_2d = core_attn_out.reshape(z_shape_og[0], num_h * head_d)
+            z_2d = z.view(z_shape_og[0], num_h * head_d)
+            if self._out_proj_accepts_prequant(head_d):
+                # Fused gated-norm + fp8 quant epilogue: bitwise-equivalent
+                # to layernorm_fn followed by the standalone per-token-group
+                # quant inside the GEMM wrapper (norm math and quant math
+                # are replicated verbatim; see rms_norm_gated_fp8_quant).
+                # Saves one full read+write of the bf16 norm output per
+                # layer on the out_proj input path.
+                q, s = rms_norm_gated_fp8_quant(
+                    x_2d,
+                    norm_weight_grouped,
+                    z_2d,
+                    eps=self.norm.eps,
+                    group_size=head_d,
+                    norm_before_gate=self.norm.norm_before_gate,
+                    activation=self.norm.activation,
+                )
+                output, _ = self.out_proj((q, s))
+                return output
             core_attn_out = layernorm_fn(
-                core_attn_out.reshape(z_shape_og[0], num_h * head_d),
+                x_2d,
                 norm_weight_grouped,
                 self.norm.bias,
-                z=z.view(z_shape_og[0], num_h * head_d),
+                z=z_2d,
                 eps=self.norm.eps,
                 group_size=head_d,
                 norm_before_gate=self.norm.norm_before_gate,
