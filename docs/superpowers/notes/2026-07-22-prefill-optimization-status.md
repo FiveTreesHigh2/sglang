@@ -122,7 +122,12 @@ Qwen3.5-35B-A3B-FP8 @ RTX PRO 5000（SM120）单卡，prefill 吞吐 +10%。
    - **等价性标准裁定（用户选定方案 A，对本项破例）**：量化段对 CUDA v2 kernel 严格逐位（隔离验证 0/33.5M）；norm 段存在不可消除的重结合偏差——PTX 实证两 kernel 的 `tl.sum(xbar²)` 归约结构不同（参考：双链 ×8，14 FMA；融合：单链 ×16，15 FMA），由 epilogue 新增锚点（fp8 单字节存储、tl.max 第二归约）触发的 Triton 布局决策改变所致，源码层无控制手段；实测偏差 11/33.5M 码字（全部 ±1 码位）+ 1/262144 scale（1 bf16 步），与生产 norm kernel 自身的 M 依赖归约序波动（calc_rows_per_block）同类。测试改为定量断言：码字偏差率 ≤2e-6 且全部 ±1 码位；scale 偏差率 ≤2e-5 且相对偏差 ≤1%；wrapper 预量化管路对逐位一致输入严格逐位（含 m%4 垫零分支）
    - 排查过程留档：三方对照（CUDA kernel / 独立 Triton 量化段 / torch fp32 仲裁）定位分歧段；`TRITON_CACHE_DIR` 落盘 PTX 做指令直方图（版本无关，JITFunction 缓存属性 API 不可靠）；中途两次误判（div_rn、硬件 cvt 平局行为）均由扫描数据纠正；另修复 wrapper 尾部 `output.to(input_2d.dtype)` 在预量化路径下错误回转 fp8 的缺陷（`263b77cd1`，由测试 dtype 断言拦截）
    - **serving 验证（audit-D1a，65.1 forwards）**：norm 调用 30.5→0.5 次/fwd、新 kernel 30 次/fwd（130.6μs vs 旧 168.7μs，169MB/130.6μs≈1.29TB/s 达带宽上限）、quant 162.5→132.4 次/fwd（-30 精确吻合）；可归因 norm -1.14 + quant -1.26 + FillFunctor -0.43 = **-2.84ms/fwd**；总量 223.98→**222.02ms（项目新低）**，差额为未触及类目 +0.9ms 同向漂移（已知窗口离散带内）。注意事项：nsys launch 必须含 `--cuda-graph-trace=node`，否则 BCG 图内 kernel（全部 GEMM/norm/quant/MoE）不展开，首次采集因此作废重采
-9. 待排期（中置信，M/L 工作量）：GDN1（conv1d epilogue 融合，估 -5.7ms）；D-ext 上半段 gather-A（-6.0ms，XL）——T1 失败与 M5 原子热点教训对涉及原子/scatter 的方案均是风险信号
+9. **GDN1 代码已提交（commit `ed7d3482f`），待服务器验证**：conv1d epilogue 融合 qkv 拆分与 qk l2norm（估 -6ms）。实现：
+   - 背景：conv 输出是纯中转张量（写 134MB/层后被 l2norm×2 + extract_v 全量回读，三者实测 3.05+3.52 ms/fwd）；BLOCK_N=256 与 head 128 及 q/k/v 边界（2048/4096）对齐，epilogue 可在寄存器内完成归一化并直写最终 dense q/k/v
+   - `causal_conv1d_triton.py`：`_causal_conv1d_fwd_kernel` 增加 constexpr 门控 `SPLIT_QKV`/`QK_L2NORM` epilogue（默认关闭、既有调用方死代码消除；conv 数学逐元素串行，无归约结合序暴露面）；新增 wrapper `causal_conv1d_fn_qkv_split`；conv_state 更新逻辑零改动（kernel 只从输入 x 读状态）
+   - `gdn_backend.py`：开关 `SGLANG_GDN_CONV_FUSION={off,v,full}`（默认 full）；v 档仅重定向 v（严格逐位，q/k 走外部 dense l2norm），full 档 l2norm 入 epilogue（有界重结合偏差，D1-a 同标准）；decode/target_verify 不受影响
+   - 测试 `test/manual/test_gdn_conv_qkv_fusion_equivalence.py`：v 档全链路严格逐位（含 conv_states 池）；full 档 q/k 定量断言（≤2e-6、±1 bf16 ulp）；varlen 覆盖多 chunk、尾块<BLOCK_M、seqlen<state_len、混合 initial_state
+10. 待排期：D-ext 上半段 gather-A（-6.0ms，XL）——T1 失败与 M5 原子热点教训对涉及原子/scatter 的方案均是风险信号
 
 当前累计：per-forward 241.4 → **222.02ms（-8.0%，audit-D1a）**；端到端待新一轮 bench 确认（预期 ≈35500+ tok/s）。距 217ms 目标尚差 ~5ms：候选为 GDN1（conv1d epilogue 融合，估 -5.7ms，M/L）与 D-ext gather-A（-6ms，XL）。生产环境变量清单（已验证）：`SGLANG_GDN_CHUNK_H_BV=64 _NUM_WARPS=4 _NUM_STAGES=2, SGLANG_GDN_WU_BK=128 _BV=128 _NUM_STAGES=3`（FUSED_A1 自 `a7e732638` 起默认开启）；`SGLANG_GDN_QKV_VIEW=1`、`SGLANG_GDN_NORM_FP8_OUT=1` 默认保留；`SGLANG_MOE_PERMUTE_COUNTING_SORT` 默认关闭。
 
