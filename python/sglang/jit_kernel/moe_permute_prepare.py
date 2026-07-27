@@ -58,7 +58,10 @@ def _moe_permute_prepare_counting(
     _count_kernel[grid](flat, counts, numel, BLOCK=BLOCK)
     offset_dtype = torch.int64 if use_int64_offset else torch.int32
     expert_offsets = torch.cumsum(counts, 0, dtype=offset_dtype)
-    cursors = expert_offsets[:num_experts].to(torch.int32).contiguous()
+    # copy=True is required: with int32 offsets, .to() would alias
+    # expert_offsets and the scatter's atomicAdd would corrupt it in place
+    # (offsets[e] += cnt_e, shifting the CSR by one segment).
+    cursors = expert_offsets[:num_experts].to(dtype=torch.int32, copy=True)
     src2dst = torch.empty(numel, dtype=torch.int32, device=flat.device)
     _scatter_rank_kernel[grid](flat, cursors, src2dst, numel, BLOCK=BLOCK)
     return expert_offsets, src2dst
