@@ -1,14 +1,67 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Tuple
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.jit_kernel.utils import cache_once, load_jit
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
+
+# Counting sort replaces torch.sort (cub radix sort, ~6 kernels and ~28us per
+# MoE layer for 64k keys with only num_experts distinct values). The atomic
+# scatter is NOT stable: ranks within an expert segment differ from the
+# radix-sorted order. Downstream this is safe: every packed row is computed
+# independently and gathered back through the same src2dst, so the final MoE
+# output is bitwise unchanged. Switch kept for controlled A/B.
+MOE_PERMUTE_COUNTING_SORT = (
+    os.getenv("SGLANG_MOE_PERMUTE_COUNTING_SORT", "1") == "1"
+)
+
+
+@triton.jit
+def _count_kernel(topk_ids, counts, numel, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < numel
+    e = tl.load(topk_ids + offs, mask=mask, other=0)
+    # counts is laid out with a leading zero slot: slot e+1 accumulates
+    # expert e so that cumsum(counts) directly yields the CSR offsets.
+    tl.atomic_add(counts + e + 1, 1, mask=mask)
+
+
+@triton.jit
+def _scatter_rank_kernel(topk_ids, cursors, src2dst, numel, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < numel
+    e = tl.load(topk_ids + offs, mask=mask, other=0)
+    pos = tl.atomic_add(cursors + e, 1, mask=mask)
+    tl.store(src2dst + offs, pos, mask=mask)
+
+
+def _moe_permute_prepare_counting(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    use_int64_offset: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    flat = topk_ids.view(-1)
+    numel = flat.numel()
+    counts = torch.zeros(num_experts + 1, dtype=torch.int32, device=flat.device)
+    BLOCK = 1024
+    grid = (triton.cdiv(numel, BLOCK),)
+    _count_kernel[grid](flat, counts, numel, BLOCK=BLOCK)
+    offset_dtype = torch.int64 if use_int64_offset else torch.int32
+    expert_offsets = torch.cumsum(counts, 0, dtype=offset_dtype)
+    cursors = expert_offsets[:num_experts].to(torch.int32).contiguous()
+    src2dst = torch.empty(numel, dtype=torch.int32, device=flat.device)
+    _scatter_rank_kernel[grid](flat, cursors, src2dst, numel, BLOCK=BLOCK)
+    return expert_offsets, src2dst
 
 
 @cache_once
@@ -55,6 +108,13 @@ def moe_permute_prepare(
         raise TypeError(f"topk_ids must be int32, got {topk_ids.dtype}")
     if not topk_ids.is_cuda:
         raise ValueError("topk_ids must be a CUDA tensor")
+
+    # Counting-sort fast path (is_ep needs the negative-id exclusion
+    # semantics of the sorted path and stays on it).
+    if MOE_PERMUTE_COUNTING_SORT and not is_ep:
+        return _moe_permute_prepare_counting(
+            topk_ids, num_experts, use_int64_offset
+        )
 
     sorted_topk_ids, reorder_ids = torch.sort(topk_ids.flatten())
     offset_dtype = torch.int64 if use_int64_offset else torch.int32
