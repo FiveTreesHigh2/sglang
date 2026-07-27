@@ -634,6 +634,10 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
             f"got {backend}"
         )
         assert input_2d.dtype == torch.float8_e4m3fn
+    # With pre-quantized fp8 input the original activation dtype is not
+    # recoverable from input_2d; the GEMM output (and the final cast below)
+    # must be bf16, never the fp8 code dtype.
+    out_dtype = torch.bfloat16 if input_scale is not None else input_2d.dtype
     # Fall back to triton for non-supported formats.
     # TODO: Check if flashinfer supports other output dtypes besides bf16.
     if backend == "trtllm" and (
@@ -654,7 +658,6 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
             # emits the (k//block_k, m) contiguous scale directly.
             q_input = input_2d
             x_scale = input_scale
-            out_dtype = torch.bfloat16
         else:
             # Quantize straight into the CUTLASS scale_major_mode="MN" contract:
             # with column_major_scales=True the A-scale storage is already
@@ -667,7 +670,6 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
                 input_2d, block_k, column_major_scales=True
             )
             x_scale = x_scale.transpose(-1, -2)
-            out_dtype = input_2d.dtype
         m_pad = (m + 3) // 4 * 4
         if m_pad != m:
             # SM120 kernel requires m to be a multiple of 4 (decode shapes
@@ -730,13 +732,13 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
             weight,
             x_scale,
             weight_scale,
-            out_dtype=input_2d.dtype,
+            out_dtype=out_dtype,
         )
 
     if bias is not None:
         output = output + bias
 
-    return output.to(dtype=input_2d.dtype).view(*output_shape)
+    return output.to(dtype=out_dtype).view(*output_shape)
 
 
 def flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback(
