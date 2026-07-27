@@ -276,7 +276,19 @@ def _rms_norm_gated_fp8_fwd_kernel(
 
     q = y * y_scale[:, None]
     q = tl.minimum(tl.maximum(q, FP8_MIN), FP8_MAX)
-    q = q.to(Q.dtype.element_ty)
+    # Emit the exact PTX instruction the CUDA v2 quant kernel uses
+    # (__nv_cvt_float2_to_fp8x2 -> cvt.rn.satfinite.e4m3x2.f32). Triton's
+    # generic fp32->fp8 cast disagrees with the hardware instruction on
+    # exact ties (e.g. 2.625 -> 2.5 vs 2.75, measured on SM120), which
+    # broke bitwise equality on ~0.07% of codes.
+    q = tl.inline_asm_elementwise(
+        asm="cvt.rn.satfinite.e4m3x2.f32 $0, $2, $1;",
+        constraints="=h,r,r",
+        args=[q],
+        dtype=tl.float8e4nv,
+        is_pure=True,
+        pack=2,
+    )
 
     Q_base = Q + rows[:, None] * stride_q_row + col_offsets
     tl.store(Q_base, q, mask=mask)
