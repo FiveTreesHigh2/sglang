@@ -266,7 +266,12 @@ def _rms_norm_gated_fp8_fwd_kernel(
     y = y.to(tl.bfloat16).to(tl.float32)
 
     _absmax = tl.maximum(tl.max(tl.abs(y), axis=1), 1e-10)
-    y_scale = FP8_MAX / _absmax
+    # IEEE-RN division to match the CUDA v2 quant kernel's `MAX / amax`:
+    # Triton's `/` lowers to div.full.f32 (approximate) on NVIDIA and
+    # drifts by 1 ulp on a subset of values, shifting fp8 codes one step.
+    y_scale = tl.math.div_rn(
+        tl.full([ROWS_PER_BLOCK], FP8_MAX, tl.float32), _absmax
+    )
     y_s = _absmax * (1.0 / FP8_MAX)
 
     q = y * y_scale[:, None]
