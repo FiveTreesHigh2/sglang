@@ -961,8 +961,10 @@ class Envs:
     # Reroutes the generic fp8 per-token-group quant (every model, not just MiniMax)
     # to the V1 JIT kernel. Off by default; V1 is byte-identical to V2.
     SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT = EnvBool(False)
-    # Opt-in fused GEMM1 input preparation for the FlashInfer SM120 FP8 MoE runner.
-    SGLANG_FLASHINFER_SM120_FP8_FUSED_A1 = EnvBool(False)
+    # Fused permute+quant A1 path for the SM120 FP8 MoE runner. Verified
+    # bitwise-equivalent and faster than the legacy three-kernel path
+    # (6.90 -> 6.02 ms/fwd on RTX PRO 5000); enabled by default.
+    SGLANG_FLASHINFER_SM120_FP8_FUSED_A1 = EnvBool(True)
     SGLANG_OPT_USE_BF16_ROUTER_GEMM = EnvBool(True)
     SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
     SGLANG_DISABLE_MSA = EnvBool(False)

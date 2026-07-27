@@ -573,8 +573,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 b, a = projected_states_ba.split(
                     [num_v_heads_tp, num_v_heads_tp], dim=-1
                 )
-                b = b.contiguous()
-                a = a.contiguous()
+                # fused_gdn_gating addresses a/b through runtime
+                # stride_a/stride_b, so the split views are consumed in place;
+                # materializing them here only added two device copies.
             else:
                 mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
                     projected_states_qkvz,
@@ -624,9 +625,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # instead: the kernel takes stride_z_row at runtime, so it reads z
             # in place, and per-group statistics are numerically identical to
             # the row-wise form.
+            # The grouped-norm weight is a fixed expansion of the frozen
+            # norm weight; build it once instead of per forward.
+            norm_weight_grouped = getattr(self, "_norm_weight_grouped", None)
+            if (
+                norm_weight_grouped is None
+                or norm_weight_grouped.numel() != num_h * head_d
+            ):
+                norm_weight_grouped = self.norm.weight.repeat(num_h)
+                self._norm_weight_grouped = norm_weight_grouped
             core_attn_out = layernorm_fn(
                 core_attn_out.reshape(z_shape_og[0], num_h * head_d),
-                self.norm.weight.repeat(num_h),
+                norm_weight_grouped,
                 self.norm.bias,
                 z=z.view(z_shape_og[0], num_h * head_d),
                 eps=self.norm.eps,

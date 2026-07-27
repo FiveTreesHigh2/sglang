@@ -151,7 +151,11 @@ def chunk_fwd_o(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    o = torch.zeros_like(v)
+    # The kernel's grid (cdiv(V, BV), NT, B*H) covers every output tile and
+    # the store at the end of chunk_fwd_kernel_o writes each in-bounds element
+    # unconditionally, so no zero-init is needed (zeros_like cost a hidden
+    # 67 MB memset per layer that never showed up in kern_sum).
+    o = torch.empty_like(v)
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
