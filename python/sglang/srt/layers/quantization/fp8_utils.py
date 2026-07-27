@@ -641,17 +641,27 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
         m, k = input_2d.shape
         n = weight.shape[0]
         # Quantize straight into the CUTLASS scale_major_mode="MN" contract:
-        # the row-padded quant writes column-major A scales (storage already
-        # (k//block_k, m_pad) contiguous, consumed below as a zero-copy
-        # transpose view) and pads m to a multiple of 4, which the SM120
-        # kernel requires. Padded rows are zero-filled so the sliced output
-        # stays bit-exact. This removes the per-call x_scale transpose+copy
-        # of the previous row-major quant -> transpose().contiguous() chain.
-        q_input, x_scale = sglang_per_token_group_quant_fp8_row_padded(
-            input_2d, block_k
+        # with column_major_scales=True the A-scale storage is already
+        # (k//block_k, m) contiguous, so the transpose below is a zero-copy
+        # view. Verified bitwise-identical to the row-major quant path
+        # (the row_padded direct-op variant is NOT bitwise-identical and is
+        # deliberately not used here). This removes the per-call x_scale
+        # transpose+copy of the previous transpose().contiguous() chain.
+        q_input, x_scale = sglang_per_token_group_quant_fp8(
+            input_2d, block_k, column_major_scales=True
         )
-        m_pad = q_input.shape[0]
         x_scale = x_scale.transpose(-1, -2)
+        m_pad = (m + 3) // 4 * 4
+        if m_pad != m:
+            # SM120 kernel requires m to be a multiple of 4 (decode shapes
+            # m=1..3). Zero-pad rows and slice the output back; prefill
+            # token buckets are all multiples of 4 and skip this branch.
+            q_input = torch.cat(
+                [q_input, q_input.new_zeros(m_pad - m, k)], dim=0
+            )
+            x_scale = torch.cat(
+                [x_scale, x_scale.new_zeros(k // block_k, m_pad - m)], dim=1
+            )
         if weight_scale_mn is not None:
             # Constant weight scale pre-transposed once at weight-load time
             # (see Fp8LinearMethod.process_weights_after_loading_block_quant);

@@ -1,17 +1,20 @@
 """Bitwise equivalence test for the dense FP8 GEMM scale-layout rework.
 
-Validates the flashinfer_cutlass dense path after switching to
-sglang_per_token_group_quant_fp8_row_padded (MN-major A scale written
-directly by the quant kernel + m padded to a multiple of 4) and to the
-load-time pre-transposed weight scale (weight_scale_mn).
+Validates the flashinfer_cutlass dense path after switching the activation
+quant to column_major_scales=True (A scale written directly into the
+CUTLASS MN-major storage, consumed as a zero-copy transpose view) and to
+the load-time pre-transposed weight scale (weight_scale_mn).
+
+Note: sglang_per_token_group_quant_fp8_row_padded is deliberately NOT used:
+its direct-op call path produces ~0.1% one-code-step rounding differences
+vs the wrapped kernel path and fails the bitwise standard.
 
 Checks (all torch.equal, i.e. bitwise):
-  1. Quantized activations: row-padded quant vs legacy row-major quant.
-  2. A-scale values: MN-major storage vs legacy transpose().contiguous().
-  3. GEMM output: new wrapper (with and without weight_scale_mn) vs the
+  1. column_major_scales=True vs False: identical q codes and scale values.
+  2. GEMM output: new wrapper (with and without weight_scale_mn) vs the
      legacy call sequence reproduced inline.
-  4. Non-multiple-of-4 m (decode shapes m=1..3): output rows match the
-     same computation performed on a zero-padded m=4 input.
+  3. Non-multiple-of-4 m (decode shapes m=1..3): output rows match the
+     same computation performed on an explicitly zero-padded m=4 input.
 
 Run on the server:
   /home/logs/sennian/pro5000-fi-moe/.venv/bin/python3 \
@@ -22,7 +25,6 @@ import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
-    sglang_per_token_group_quant_fp8_row_padded,
 )
 
 BLOCK = 128
@@ -66,19 +68,21 @@ def main():
     weight, weight_scale = make_weight(n, k, seed=11)
     weight_scale_mn = weight_scale.transpose(-1, -2).contiguous()
 
-    # --- 1/2: quant outputs ---
+    # --- 1: col-major quant bitwise-equal to row-major quant ---
     q_ref, s_ref = sglang_per_token_group_quant_fp8(x, BLOCK, column_major_scales=False)
-    q_new, s_new = sglang_per_token_group_quant_fp8_row_padded(x, BLOCK)
-    assert q_new.shape[0] == m, "m=8192 must not pad"
+    q_new, s_new = sglang_per_token_group_quant_fp8(x, BLOCK, column_major_scales=True)
     assert torch.equal(
         q_new.view(torch.uint8), q_ref.view(torch.uint8)
     ), "quantized activations differ"
-    assert torch.equal(
-        s_new.transpose(-1, -2).contiguous(), s_ref.transpose(-1, -2).contiguous()
-    ), "A-scale values differ"
-    print("[PASS] 1/2: row-padded quant bitwise-equal to legacy quant (m=8192)")
+    assert torch.equal(s_new.contiguous(), s_ref.contiguous()), "A-scale values differ"
+    s_mn = s_new.transpose(-1, -2)
+    assert s_mn.shape == (k // BLOCK, m) and s_mn.is_contiguous(), (
+        "col-major scale storage is not (k//block, m) contiguous: "
+        f"shape={tuple(s_mn.shape)} strides={s_mn.stride()}"
+    )
+    print("[PASS] 1: col-major quant bitwise-equal to row-major quant (m=8192)")
 
-    # --- 3: full wrapper vs legacy sequence ---
+    # --- 2: full wrapper vs legacy sequence ---
     out_legacy = legacy_gemm(x, weight, weight_scale)
     out_new = new_gemm(x, weight, [BLOCK, BLOCK], weight_scale)
     out_new_mn = new_gemm(
@@ -86,9 +90,9 @@ def main():
     )
     assert torch.equal(out_new, out_legacy), "wrapper output != legacy output"
     assert torch.equal(out_new_mn, out_legacy), "weight_scale_mn output differs"
-    print("[PASS] 3: new wrapper bitwise-equal to legacy sequence (m=8192)")
+    print("[PASS] 2: new wrapper bitwise-equal to legacy sequence (m=8192)")
 
-    # --- 4: decode shapes m=1..3 vs zero-padded m=4 ---
+    # --- 3: decode shapes m=1..3 vs explicitly zero-padded m=4 ---
     for m_small in (1, 2, 3):
         xs = torch.randn(m_small, k, device=DEVICE, dtype=torch.bfloat16)
         x_pad = torch.zeros(4, k, device=DEVICE, dtype=torch.bfloat16)
@@ -101,7 +105,7 @@ def main():
         )
         assert out_small.shape[0] == m_small
         assert torch.equal(out_small, out_pad[:m_small]), f"m={m_small} rows differ"
-        print(f"[PASS] 4: m={m_small} matches zero-padded m=4 computation")
+        print(f"[PASS] 3: m={m_small} matches zero-padded m=4 computation")
 
     print("ALL PASS")
 
