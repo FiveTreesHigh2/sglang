@@ -266,11 +266,20 @@ def _rms_norm_gated_fp8_fwd_kernel(
     y = y.to(tl.bfloat16).to(tl.float32)
 
     _absmax = tl.maximum(tl.max(tl.abs(y), axis=1), 1e-10)
-    # IEEE-RN division to match the CUDA v2 quant kernel's `MAX / amax`:
-    # Triton's `/` lowers to div.full.f32 (approximate) on NVIDIA and
-    # drifts by 1 ulp on a subset of values, shifting fp8 codes one step.
-    y_scale = tl.math.div_rn(
-        tl.full([ROWS_PER_BLOCK], FP8_MAX, tl.float32), _absmax
+    # The production v2 quant kernel is built with --use_fast_math
+    # (jit_kernel/per_token_group_quant_8bit_v2.py and the AOT sgl-kernel
+    # CMake flags), so nvcc lowers its `MAX / amax` to the approximate
+    # div.full.f32 rather than IEEE div.rn. Emit the identical instruction:
+    # measured 0/33.5M code mismatches vs the CUDA kernel, whereas div_rn
+    # left 24937 (the ~1 ulp scale drift lands products on the other side
+    # of fp8 rounding boundaries).
+    y_scale = tl.inline_asm_elementwise(
+        asm="div.full.f32 $0, $1, $2;",
+        constraints="=r,r,r",
+        args=[tl.full([ROWS_PER_BLOCK], FP8_MAX, tl.float32), _absmax],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
     )
     y_s = _absmax * (1.0 / FP8_MAX)
 
