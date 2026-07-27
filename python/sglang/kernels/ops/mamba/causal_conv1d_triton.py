@@ -6,6 +6,8 @@
 
 from typing import List, Optional, Union
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -13,6 +15,22 @@ import triton.language as tl
 from sglang.jit_kernel.utils import is_arch_support_pdl
 
 PAD_SLOT_ID = -1
+
+# Launch configuration of the prefill conv kernel. Defaults inherited from
+# the upstream vLLM launcher (8/256/4/2) with no SM120-specific provenance;
+# exposed as env knobs for offline single-config scans. Runtime autotune is
+# NOT an option: the kernel updates conv_states in place and the
+# chunk_offset==0 shift path is not idempotent, so multi-config re-execution
+# would corrupt the state pool (same failure class as GDN chunk_h).
+GDN_CONV_BLOCK_M = int(os.getenv("SGLANG_GDN_CONV_BLOCK_M", "8"))
+GDN_CONV_NUM_WARPS = int(os.getenv("SGLANG_GDN_CONV_NUM_WARPS", "4"))
+GDN_CONV_NUM_STAGES = int(os.getenv("SGLANG_GDN_CONV_NUM_STAGES", "2"))
+# Channel-block width, shared by both launchers. The qkv-split epilogue
+# additionally requires it to divide the q/k/v region boundaries and to be
+# a multiple of the head width (asserted in causal_conv1d_fn_qkv_split).
+# Note: changing it reshapes the fused qk l2norm reduction, so the
+# equivalence test must be re-run before adopting a non-default value.
+QKV_SPLIT_BLOCK_N = int(os.getenv("SGLANG_GDN_CONV_BLOCK_N", "256"))
 
 
 @triton.jit()
@@ -607,16 +625,12 @@ def causal_conv1d_fn(
         USE_PAD_SLOT=pad_slot_id is not None,
         NP2_STATELEN=np2_statelen,
         # launch_cooperative_grid=True
-        BLOCK_M=8,
-        BLOCK_N=256,
-        num_stages=2,
+        BLOCK_M=GDN_CONV_BLOCK_M,
+        BLOCK_N=QKV_SPLIT_BLOCK_N,
+        num_warps=GDN_CONV_NUM_WARPS,
+        num_stages=GDN_CONV_NUM_STAGES,
     )
     return out
-
-
-# Channel-block width of _causal_conv1d_fwd_kernel; the qkv-split epilogue
-# requires the q/k/v region boundaries to align with it.
-QKV_SPLIT_BLOCK_N = 256
 
 
 def causal_conv1d_fn_qkv_split(
@@ -750,9 +764,10 @@ def causal_conv1d_fn_qkv_split(
         Q_DIM=q_dim,
         K_DIM=k_dim,
         HEAD_D=head_qk_dim,
-        BLOCK_M=8,
+        BLOCK_M=GDN_CONV_BLOCK_M,
         BLOCK_N=QKV_SPLIT_BLOCK_N,
-        num_stages=2,
+        num_warps=GDN_CONV_NUM_WARPS,
+        num_stages=GDN_CONV_NUM_STAGES,
     )
     return q, k, v
 
