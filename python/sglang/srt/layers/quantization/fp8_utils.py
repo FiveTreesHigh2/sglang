@@ -670,17 +670,12 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
                 input_2d, block_k, column_major_scales=True
             )
             x_scale = x_scale.transpose(-1, -2)
-        m_pad = (m + 3) // 4 * 4
-        if m_pad != m:
-            # SM120 kernel requires m to be a multiple of 4 (decode shapes
-            # m=1..3). Zero-pad rows and slice the output back; prefill
-            # token buckets are all multiples of 4 and skip this branch.
-            q_input = torch.cat(
-                [q_input, q_input.new_zeros(m_pad - m, k)], dim=0
-            )
-            x_scale = torch.cat(
-                [x_scale, x_scale.new_zeros(k // block_k, m_pad - m)], dim=1
-            )
+        # No m%4 zero-padding: the alignment note in the FlashInfer docs does
+        # not bind this dense groupwise path. Verified bitwise on SM120
+        # (m=1..7 unpadded == zero-padded outputs), and production ran this
+        # call unpadded before the padding was introduced. The pad's two
+        # torch.cat launches per GEMM cost ~0.7 ms/step at decode bs<=3
+        # (162 dense GEMMs per forward).
         if weight_scale_mn is not None:
             # Constant weight scale pre-transposed once at weight-load time
             # (see Fp8LinearMethod.process_weights_after_loading_block_quant);
@@ -688,14 +683,14 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
             weight_scale = weight_scale_mn
         elif weight_scale.shape == (n // block_n, k // block_k):
             weight_scale = weight_scale.transpose(-1, -2).contiguous()
-        expected_x_scale_shape = (k // block_k, m_pad)
+        expected_x_scale_shape = (k // block_k, m)
         expected_weight_scale_shape = (k // block_k, n // block_n)
         assert x_scale.shape == expected_x_scale_shape, (
             "FlashInfer CUTLASS groupwise FP8 expects A scale layout "
-            f"(k//block_k, m_pad) for scale_major_mode='MN', got {tuple(x_scale.shape)}; "
+            f"(k//block_k, m) for scale_major_mode='MN', got {tuple(x_scale.shape)}; "
             f"expected {expected_x_scale_shape}. "
             f"strides={x_scale.stride()} is_contiguous={x_scale.is_contiguous()} "
-            f"m={m} m_pad={m_pad} n={n} k={k} block_size={block_size}"
+            f"m={m} n={n} k={k} block_size={block_size}"
         )
         assert weight_scale.shape == expected_weight_scale_shape, (
             "FlashInfer CUTLASS groupwise FP8 expects B scale layout "
@@ -719,8 +714,6 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
             weight_scale,
             out_dtype=out_dtype,
         )
-        if m_pad != m:
-            output = output[:m]
     else:
         # TRTLLM consumes the SGLang column-major scale layout natively.
         assert input_scale is None

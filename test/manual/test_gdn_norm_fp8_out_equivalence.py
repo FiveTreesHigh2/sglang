@@ -18,8 +18,8 @@ Assertions:
      (one bf16 step of amax is ~0.78%).
   3. Wrapper plumbing is strictly bitwise: feeding the CUDA-quantized
      (q_ref, s_ref) through the pre-quantized input path reproduces the
-     internal-quant GEMM output exactly (torch.equal), including the
-     m % 4 != 0 zero-pad branch.
+     internal-quant GEMM output exactly (torch.equal), including
+     m % 4 != 0 shapes (run unpadded since the B14 pad removal).
   4. End-to-end: rows whose fused (q, s) are bitwise-identical to the
      reference produce bitwise-identical GEMM outputs; affected rows are
      bounded by the same fraction as (1).
@@ -213,7 +213,7 @@ def main():
     run_kernel_case(T=4093, H=32, D=128, activation="sigmoid", seed=2)
     run_kernel_case(T=17, H=32, D=128, activation="sigmoid", seed=3)
     run_gemm_case(T=8192, H=32, D=128, activation="sigmoid", seed=4)
-    run_gemm_case(T=4093, H=32, D=128, activation="sigmoid", seed=5)  # m%4 pad
+    run_gemm_case(T=4093, H=32, D=128, activation="sigmoid", seed=5)  # m%4 != 0
     run_gemm_case(T=8192, H=32, D=128, activation="swish", seed=6)
     print("ALL PASS")
 
