@@ -131,11 +131,12 @@ Qwen3.5-35B-A3B-FP8 @ RTX PRO 5000（SM120）单卡，prefill 吞吐 +10%。
    - **serving 验证（audit-gdn1，66.9 forwards）**：l2norm_strided 60→0（-3.05ms）、extract_columns 30→0（-3.52ms）、conv 238→234.9μs（-0.13ms，epilogue 无代价）；可归因 **-6.70ms/fwd**（预估 -6）；总量 222.02→**216.41ms**，差额为未触及类目 +1.1ms 同向漂移
 10. 待排期：D-ext 上半段 gather-A（-6.0ms，XL）；conv launch 参数扫描（上限 ≈-0.9ms，conv 现 1.14TB/s vs 1.29 上限）——目标已达成，两项仅在需要进一步余量时启动
 
-⚠️ **精度回归：双重根因均已定位并修复（commits `e7e975519` + `e655da92e`），待最终验证**：
+✅ **精度回归已修复并验收（commits `e7e975519` + `e655da92e`）**：
 - **缺陷 1（-1 补齐路由越界）**：fused A1/A2 kernel 以 `uint32_t` 读 topk_ids，CUDA graph 补齐行的 -1 回绕后 `m_indptr` 越界读 ~17GB、scale 列任意写；离线 16 补齐行复现 illegal access。修复：`expert >= num_experts` 守卫 + expert 0 前缀 scale 列清零；legacy Triton pack-scale 补显式 mask
-- **缺陷 2（PDL 触发点位置错误，主要致错源）**：FI SM120 grouped GEMM 以 `cudaLaunchAttributeProgrammaticStreamSerialization` 启动（PDL secondary），其 wait 在 primary 全部 block 触发后即返回；fused kernel 的 `PDLTriggerSecondary` 位于输出存储之前 → GEMM1 读到未提交的 packed/scale。证据链：端到端离线复现 T=8192 非确定性 mismatch（2341~16358、NaN）且小 T 全净；切换非 PDL 变体后 20+10 轮全净；阶段级对拍全净（消费方无 PDL 属性）；legacy 免疫（其 GEMM 前驱为 Triton kernel 无早触发，wait 退化为完整完成）；A2 同构缺陷但触发后窗口极小未实际命中。修复：两 kernel 触发点全部后移至存储之后（保留 PDL 重叠收益）。排查链全程：开关二分 R0-R5 → -1 对拍（缺陷 1）→ E1/E2/E3 图变量分离 → 端到端离线复现 → S1/S2/S3 PDL 变体判定（缺陷 2）
+- **缺陷 2（PDL 触发点位置错误，主要致错源）**：FI SM120 grouped GEMM 以 `cudaLaunchAttributeProgrammaticStreamSerialization` 启动（PDL secondary），其 wait 在 primary 全部 block 触发后即返回；fused kernel 的 `PDLTriggerSecondary` 位于输出存储之前 → GEMM1 读到未提交的 packed/scale。修复：两 kernel 触发点后移至全部存储之后（规范形态参照上游 per_token_group_quant_8bit_v2.cu）。缺陷代码源自 `41ae2a2ec`/`b08848d54`（07-21/22，当时 A1 默认关闭、A2 窗口极小无症状，B13 翻转默认值后暴露）
+- **验收**：端到端对拍全净；GSM8K/MMLU 恢复至基线水平（用户确认）；修复后吞吐三轮 36963.98/36592.05/36515.20，无性能代价。排查链全程：开关二分 R0-R5 → -1 对拍（缺陷 1）→ E1/E2/E3 图变量分离 → 端到端离线复现（非确定性 mismatch+NaN）→ S1/S2/S3 PDL 变体判定（缺陷 2）。流程改进已固化：fused 路径独立逐位对拍（含 -1 行）、N 轮重复验收捕捉非确定性、精度评测纳入收尾必经步骤
 
-当前累计：per-forward 241.4 → **216.41ms（-10.35%，audit-gdn1）**；端到端 300×3 中位数 36268.38 vs 32664.57 tok/s = **+11.03%（入账以精度回归修复为前提）**。生产环境变量清单（已验证）：`SGLANG_GDN_CHUNK_H_BV=64 _NUM_WARPS=4 _NUM_STAGES=2, SGLANG_GDN_WU_BK=128 _BV=128 _NUM_STAGES=3`（FUSED_A1 自 `a7e732638` 起默认开启）；`SGLANG_GDN_QKV_VIEW=1`、`SGLANG_GDN_NORM_FP8_OUT=1`、`SGLANG_GDN_CONV_FUSION=full` 默认保留；`SGLANG_MOE_PERMUTE_COUNTING_SORT` 默认关闭。
+当前累计（最终入账）：per-forward 241.4 → **216.41ms（-10.35%，audit-gdn1）**；端到端修复后三轮中位数 **36592.05 vs 基线 32664.57 tok/s = +12.02%**（三轮全部高于 +10% 线）；精度 GSM8K/MMLU 与基线持平——**10% 目标以吞吐+精度双口径达成，项目收尾**。生产环境变量清单（已验证）：`SGLANG_GDN_CHUNK_H_BV=64 _NUM_WARPS=4 _NUM_STAGES=2, SGLANG_GDN_WU_BK=128 _BV=128 _NUM_STAGES=3`（FUSED_A1 自 `a7e732638` 起默认开启）；`SGLANG_GDN_QKV_VIEW=1`、`SGLANG_GDN_NORM_FP8_OUT=1`、`SGLANG_GDN_CONV_FUSION=full` 默认保留；`SGLANG_MOE_PERMUTE_COUNTING_SORT` 默认关闭。
 
 旋钮清单（默认值=现状）：
 - chunk_o：`SGLANG_GDN_CHUNK_O_BK/_BV/_NUM_WARPS/_NUM_STAGES`（128/64/4/2）
