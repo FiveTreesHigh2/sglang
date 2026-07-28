@@ -85,7 +85,6 @@ __global__ __launch_bounds__(1024, 2) void flashinfer_sm120_fp8_quant_scatter_ke
       }
     }
 
-    PDLTriggerSecondary<kUsePDL>();
     if (valid_group) {
       for (uint32_t choice = 0; choice < params.top_k; ++choice) {
         const uint32_t route = token * params.top_k + choice;
@@ -112,6 +111,14 @@ __global__ __launch_bounds__(1024, 2) void flashinfer_sm120_fp8_quant_scatter_ke
         }
       }
     }
+    // Trigger only after this block's stores are issued. The dependent
+    // FlashInfer grouped GEMM launches with
+    // cudaLaunchAttributeProgrammaticStreamSerialization and its
+    // griddepcontrol wait returns once every primary block has triggered:
+    // stores issued after the trigger are not guaranteed visible to it.
+    // The old trigger-before-stores placement raced with GEMM1's input
+    // reads (nondeterministic large-T corruption on the fused A1 path).
+    PDLTriggerSecondary<kUsePDL>();
     return;
   }
 
@@ -126,7 +133,6 @@ __global__ __launch_bounds__(1024, 2) void flashinfer_sm120_fp8_quant_scatter_ke
       : ((end + 3u * (expert + 1)) / 4u) * 4u;
   const uint32_t gap = next - valid_end;
 
-  PDLTriggerSecondary<kUsePDL>();
   if (gap != 0) {
     for (uint32_t i = threadIdx.x; i < num_groups * gap; i += blockDim.x) {
       const uint32_t group = i / gap;
@@ -149,6 +155,8 @@ __global__ __launch_bounds__(1024, 2) void flashinfer_sm120_fp8_quant_scatter_ke
       }
     }
   }
+  // See the route branch: trigger after the zero-fill stores are issued.
+  PDLTriggerSecondary<kUsePDL>();
 }
 
 }  // namespace

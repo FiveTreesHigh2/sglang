@@ -64,8 +64,7 @@ __global__ __launch_bounds__(1024, 2) void flashinfer_sm120_fp8_silu_quant_pack_
       // CUDA-graph padded rows carry topk_ids == -1; indexing m_indptr with
       // the wrapped value is a wild read and the derived scale column a wild
       // store (same defect class as the fused-A1 kernel). Skip the route
-      // entirely; trigger PDL so the dependent launch is not held back.
-      PDLTriggerSecondary<kUsePDL>();
+      // entirely; a block exit counts as the PDL trigger.
       return;
     }
     const uint32_t dst = params.src2dst[route];
@@ -112,13 +111,18 @@ __global__ __launch_bounds__(1024, 2) void flashinfer_sm120_fp8_silu_quant_pack_
       }
     }
 
-    PDLTriggerSecondary<kUsePDL>();
     if (valid_group) {
       out_vec.store(output, vector_id);
       if (lane_in_work == 0) {
         params.output_scale[static_cast<int64_t>(work_id) * params.m_padded + scale_col] = scale;
       }
     }
+    // Trigger only after this block's stores are issued: GEMM2 launches as
+    // a PDL secondary and its griddepcontrol wait does not cover stores
+    // issued after the trigger (same race class as the fused-A1 kernel;
+    // here the post-trigger window was small enough to never fire, but the
+    // placement was equally incorrect).
+    PDLTriggerSecondary<kUsePDL>();
     return;
   }
 
@@ -130,7 +134,6 @@ __global__ __launch_bounds__(1024, 2) void flashinfer_sm120_fp8_silu_quant_pack_
   const uint32_t next = expert + 1 == params.num_experts ? params.m_padded : ((end + 3u * (expert + 1)) / 4u) * 4u;
   const uint32_t gap = next - valid_end;
 
-  PDLTriggerSecondary<kUsePDL>();
   if (gap != 0) {
     for (uint32_t i = threadIdx.x; i < num_groups * gap; i += blockDim.x) {
       const uint32_t group = i / gap;
@@ -151,6 +154,8 @@ __global__ __launch_bounds__(1024, 2) void flashinfer_sm120_fp8_silu_quant_pack_
       }
     }
   }
+  // Trigger after the zero-fill stores are issued.
+  PDLTriggerSecondary<kUsePDL>();
 }
 
 }  // namespace
