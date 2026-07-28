@@ -131,7 +131,7 @@ Qwen3.5-35B-A3B-FP8 @ RTX PRO 5000（SM120）单卡，prefill 吞吐 +10%。
    - **serving 验证（audit-gdn1，66.9 forwards）**：l2norm_strided 60→0（-3.05ms）、extract_columns 30→0（-3.52ms）、conv 238→234.9μs（-0.13ms，epilogue 无代价）；可归因 **-6.70ms/fwd**（预估 -6）；总量 222.02→**216.41ms**，差额为未触及类目 +1.1ms 同向漂移
 10. 待排期：D-ext 上半段 gather-A（-6.0ms，XL）；conv launch 参数扫描（上限 ≈-0.9ms，conv 现 1.14TB/s vs 1.29 上限）——目标已达成，两项仅在需要进一步余量时启动
 
-当前累计：per-forward 241.4 → **216.41ms（-10.35%，audit-gdn1），已跌破 217ms 目标线**；端到端最终入账待 300×3 中位数双边对比（基线 32659.7 tok/s，预期 ≈36000+）。生产环境变量清单（已验证）：`SGLANG_GDN_CHUNK_H_BV=64 _NUM_WARPS=4 _NUM_STAGES=2, SGLANG_GDN_WU_BK=128 _BV=128 _NUM_STAGES=3`（FUSED_A1 自 `a7e732638` 起默认开启）；`SGLANG_GDN_QKV_VIEW=1`、`SGLANG_GDN_NORM_FP8_OUT=1`、`SGLANG_GDN_CONV_FUSION=full` 默认保留；`SGLANG_MOE_PERMUTE_COUNTING_SORT` 默认关闭。
+当前累计：per-forward 241.4 → **216.41ms（-10.35%，audit-gdn1）**；端到端 **300×3 中位数双边对比已完成最终入账：36268.38 vs 32664.57 tok/s = +11.03%**（新配置三轮 36663.16/36268.38/36189.49，基线三轮 32915.97/32664.57/32562.95，三轮全部高于 +10% 线 35931）——**10% 目标达成，项目转入收尾**。生产环境变量清单（已验证）：`SGLANG_GDN_CHUNK_H_BV=64 _NUM_WARPS=4 _NUM_STAGES=2, SGLANG_GDN_WU_BK=128 _BV=128 _NUM_STAGES=3`（FUSED_A1 自 `a7e732638` 起默认开启）；`SGLANG_GDN_QKV_VIEW=1`、`SGLANG_GDN_NORM_FP8_OUT=1`、`SGLANG_GDN_CONV_FUSION=full` 默认保留；`SGLANG_MOE_PERMUTE_COUNTING_SORT` 默认关闭。
 
 旋钮清单（默认值=现状）：
 - chunk_o：`SGLANG_GDN_CHUNK_O_BK/_BV/_NUM_WARPS/_NUM_STAGES`（128/64/4/2）
