@@ -45,9 +45,13 @@ def _pack_flashinfer_sm120_fp8_scale_kernel(
     k_mask = k_blocks < num_k_blocks
 
     experts = tl.load(topk_ids_ptr + routes, mask=route_mask, other=0)
+    # CUDA-graph padded rows carry topk_ids == -1: they own no scale column
+    # and indexing m_indptr with them is out of bounds. Drop them here
+    # explicitly (the previous behavior only worked by accident of layout).
+    valid_mask = route_mask & (experts >= 0)
     dst_rows = tl.load(src2dst_ptr + routes, mask=route_mask, other=0)
     expert_starts = tl.load(
-        m_indptr_ptr + experts, mask=route_mask, other=0
+        m_indptr_ptr + experts, mask=valid_mask, other=0
     )
     aligned_starts = ((expert_starts + 3 * experts) // 4) * 4
     output_cols = aligned_starts + dst_rows - expert_starts
@@ -57,7 +61,7 @@ def _pack_flashinfer_sm120_fp8_scale_kernel(
     else:
         source_rows = routes // top_k
 
-    mask = route_mask[:, None] & k_mask[None, :]
+    mask = valid_mask[:, None] & k_mask[None, :]
     source_offsets = (
         source_rows[:, None] * source_stride_m
         + k_blocks[None, :] * source_stride_k

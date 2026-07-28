@@ -89,8 +89,18 @@ __global__ __launch_bounds__(1024, 2) void flashinfer_sm120_fp8_quant_scatter_ke
     if (valid_group) {
       for (uint32_t choice = 0; choice < params.top_k; ++choice) {
         const uint32_t route = token * params.top_k + choice;
-        const uint32_t dst = params.src2dst[route];
         const uint32_t expert = params.topk_ids[route];
+        if (expert >= params.num_experts) {
+          // CUDA-graph padded rows carry topk_ids == -1 (see
+          // _mask_topk_ids_padded_region); the unsigned compare also covers
+          // any other out-of-range id. Indexing m_indptr with the wrapped
+          // value reads ~17GB out of bounds and the derived scale column
+          // becomes a wild store: an illegal access in isolation, silent
+          // allocator-pool corruption in serving (root cause of the
+          // fused-A1 accuracy regression).
+          continue;
+        }
+        const uint32_t dst = params.src2dst[route];
         const uint32_t start = params.m_indptr[expert];
         const uint32_t aligned = ((start + 3u * expert) / 4u) * 4u;
         const uint32_t column = aligned + dst - start;
@@ -122,6 +132,21 @@ __global__ __launch_bounds__(1024, 2) void flashinfer_sm120_fp8_quant_scatter_ke
       const uint32_t group = i / gap;
       const uint32_t column = valid_end + i % gap;
       params.output_scale[static_cast<int64_t>(group) * params.m_padded + column] = 0.0f;
+    }
+  }
+  // Padded (-1) routes are dumped into packed rows [0, m_indptr[0]) by the
+  // CSR convention and, after the guard above, never write a scale column.
+  // Zero the corresponding prefix columns [0, aligned-start-of-expert-0) so
+  // the packed scale is fully initialized (the legacy path relied on the
+  // wrapper's out.zero_()).
+  if (expert == 0) {
+    const uint32_t prefix = (start / 4u) * 4u;
+    if (prefix != 0) {
+      for (uint32_t i = threadIdx.x; i < num_groups * prefix; i += blockDim.x) {
+        const uint32_t group = i / prefix;
+        const uint32_t column = i % prefix;
+        params.output_scale[static_cast<int64_t>(group) * params.m_padded + column] = 0.0f;
+      }
     }
   }
 }

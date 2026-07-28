@@ -59,8 +59,16 @@ __global__ __launch_bounds__(1024, 2) void flashinfer_sm120_fp8_silu_quant_pack_
 
   if (blockIdx.x < params.num_routes) {
     const uint32_t route = blockIdx.x;
-    const uint32_t dst = params.src2dst[route];
     const uint32_t expert = params.topk_ids[route];
+    if (expert >= params.num_experts) {
+      // CUDA-graph padded rows carry topk_ids == -1; indexing m_indptr with
+      // the wrapped value is a wild read and the derived scale column a wild
+      // store (same defect class as the fused-A1 kernel). Skip the route
+      // entirely; trigger PDL so the dependent launch is not held back.
+      PDLTriggerSecondary<kUsePDL>();
+      return;
+    }
+    const uint32_t dst = params.src2dst[route];
     const uint32_t expert_start = params.m_indptr[expert];
     const uint32_t aligned_start = ((expert_start + 3u * expert) / 4u) * 4u;
     const uint32_t scale_col = aligned_start + dst - expert_start;
@@ -128,6 +136,19 @@ __global__ __launch_bounds__(1024, 2) void flashinfer_sm120_fp8_silu_quant_pack_
       const uint32_t group = i / gap;
       const uint32_t column = valid_end + i % gap;
       params.output_scale[static_cast<int64_t>(group) * params.m_padded + column] = 0.0f;
+    }
+  }
+  // Zero the prefix columns [0, aligned-start-of-expert-0): padded (-1)
+  // routes own packed rows below m_indptr[0] but no scale column, and this
+  // buffer is allocated with torch.empty.
+  if (expert == 0) {
+    const uint32_t prefix = (start / 4u) * 4u;
+    if (prefix != 0) {
+      for (uint32_t i = threadIdx.x; i < num_groups * prefix; i += blockDim.x) {
+        const uint32_t group = i / prefix;
+        const uint32_t column = i % prefix;
+        params.output_scale[static_cast<int64_t>(group) * params.m_padded + column] = 0.0f;
+      }
     }
   }
 }
