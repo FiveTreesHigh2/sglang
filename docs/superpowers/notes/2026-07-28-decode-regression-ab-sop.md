@@ -221,6 +221,29 @@ smem tile-cumsum 协作预计算 + 二分查找，枚举顺序逐位不变。改
 4. 残差清尾：B14 已由 18af088bd revert；B3/守卫 ~0.05-0.1ms 待 D 组归因定夺
 5. 算法级：投机解码（MTP/EAGLE）为 bs=1 的数量级杠杆，另立项目
 
+### 2026-07-30 decode 预算表（dec-budget-01，bs=1，gated on，锚点 2195 步）
+
+注：采集时误带 FUSED_A1=0（launch 参数失误，生产无此问题），A1 三行按 fused 修正约 -0.1ms/step；绝对值含 ~10% 窗口膨胀，比例可信。
+
+| 类目 | 发/步 | ms/step | 占比 |
+|---|---|---|---|
+| dense GEMM | 160 | 3.50 | 45.8% |
+| LM head GEMV（cublas bf16，~750GB/s） | 1 | 0.83 | 10.9% |
+| MoE GEMM1（gated，18.8μs/发） | 40 | 0.75 | 9.9% |
+| MoE GEMM2（10.0μs/发） | 40 | 0.40 | 5.2% |
+| 激活 quant | 160* | 0.21* | 2.8% |
+| unpermute/combine | 40 | 0.26 | 3.5% |
+| GDN recurrent+conv | 60 | 0.25 | 3.2% |
+| router+topk sort | 80 | 0.22 | 2.8% |
+| attention | 10 | 0.17 | 2.2% |
+| norm 类 | 110 | 0.18 | 2.3% |
+| A1 fused glue* | 80 | ~0.09* | 1.2% |
+| A2 quant_pack（gated） | 40 | 0.05 | 0.7% |
+
+（* = 按 fused A1 修正后的估值）
+
+**修正后的优先级**：① LM head GEMV（单项 0.83ms、带宽利用率仅 ~47%、普适、~0.4ms 上限）②MoE glue 融合（unpermute FINALIZE + gated GEMM1 小 M 税 18.8vs10.0μs，等上游或自研）③ dense GEMM 3.5ms 大头（latency-bound，暂留档）。
+
 ### 2026-07-29 档 A 完成（提前启动，未等 nightly）
 
 - 方式：cherry-pick #4130（merge commit 92274ba1）到 pinned tag `b35396c1`，零冲突；依赖核查：97 个中间 commit 仅 #4185 触碰相关路径且只改 cuDNN 测试标记，PR 引用符号在 tag 上全部存在。分支 `adopt-pr4130`（`55b030f3`，含我们移植的 256-expert 稀疏 case ×4）已推 fork。部署仍走文件覆盖（27 文件含 2 个 Python core.py——op 绑定加了 is_gated 参数）
