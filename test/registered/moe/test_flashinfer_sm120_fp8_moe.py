@@ -37,7 +37,7 @@ def _layout_reference(source, topk_ids, src2dst, m_indptr, source_is_packed):
     return result
 
 
-def _make_runner_case(tokens, top_k, topk_ids, seed=11):
+def _make_runner_case(tokens, top_k, topk_ids, seed=11, gated=False):
     from flashinfer.testing.utils import per_block_cast_to_fp8
     from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
     from sglang.srt.layers.moe.moe_runner.flashinfer_sm120_fp8 import (
@@ -84,6 +84,16 @@ def _make_runner_case(tokens, top_k, topk_ids, seed=11):
 
     w13, w13_scale = quantize(w13_bf16)
     w2, w2_scale = quantize(w2_bf16)
+    if gated:
+        # is_gated GEMM expects up in [0, N) and gate in [N, 2N); block
+        # boundaries (128) align with the halves so the flip commutes with
+        # blockwise quantization.
+        half = w13.shape[1] // 2
+        scale_half = w13_scale.shape[1] // 2
+        w13 = torch.cat([w13[:, half:], w13[:, :half]], dim=1).contiguous()
+        w13_scale = torch.cat(
+            [w13_scale[:, scale_half:], w13_scale[:, :scale_half]], dim=1
+        ).contiguous()
     w13_scale_fi, w2_scale_fi = prepare_flashinfer_sm120_fp8_weight_scales(
         w13_scale,
         w2_scale,
@@ -116,6 +126,7 @@ def _make_runner_case(tokens, top_k, topk_ids, seed=11):
         w13_scale_fi,
         w2_scale_fi,
         (128, 128),
+        w13_up_first=gated,
     )
     return dispatch, config, quant_info, w13_scale, w2_scale
 
@@ -936,6 +947,170 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
             rtol=1e-6,
             atol=0,
         )
+
+    def test_fused_quant_pack_matches_generic_quant_reference(self):
+        from sglang.kernels.ops.moe.flashinfer_sm120_fp8 import (
+            fused_quant_pack_flashinfer_sm120_fp8,
+            pack_flashinfer_sm120_fp8_scale,
+        )
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+
+        torch.manual_seed(29)
+        tokens, top_k, experts, hidden = 8, 2, 8, 512
+        topk_ids = torch.tensor(
+            [
+                [3, 0],
+                [1, 1],
+                [7, 2],
+                [0, 6],
+                [5, 3],
+                [4, 0],
+                [6, 6],
+                [2, 7],
+            ],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        _, src2dst, m_indptr = moe_permute(
+            torch.zeros(
+                (tokens, 128),
+                device="cuda",
+                dtype=torch.float8_e4m3fn,
+            ),
+            topk_ids,
+            experts,
+        )
+
+        activated = torch.randn(
+            (tokens * top_k, hidden),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        ref_q, ref_scale = sglang_per_token_group_quant_fp8(
+            activated,
+            128,
+        )
+        expected_scale = pack_flashinfer_sm120_fp8_scale(
+            ref_scale,
+            topk_ids,
+            src2dst,
+            m_indptr,
+            source_is_packed=True,
+        )
+
+        actual_q, actual_scale = fused_quant_pack_flashinfer_sm120_fp8(
+            activated,
+            topk_ids,
+            src2dst,
+            m_indptr,
+        )
+        torch.testing.assert_close(
+            actual_q.view(torch.uint8),
+            ref_q.view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            actual_scale,
+            expected_scale,
+            rtol=1e-6,
+            atol=0,
+        )
+
+    def test_w13_half_flip_commutes_with_block_quant(self):
+        from flashinfer.testing.utils import per_block_cast_to_fp8
+
+        torch.manual_seed(31)
+        intermediate, hidden = 256, 256
+        w13_bf16 = torch.randn(
+            2 * intermediate,
+            hidden,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        quantized, scale = per_block_cast_to_fp8(w13_bf16)
+        flipped_then_quant, flipped_scale_ref = per_block_cast_to_fp8(
+            torch.cat(
+                [w13_bf16[intermediate:], w13_bf16[:intermediate]], dim=0
+            ).contiguous()
+        )
+        half = quantized.shape[0] // 2
+        scale_half = scale.shape[0] // 2
+        quant_then_flip = torch.cat(
+            [quantized[half:], quantized[:half]], dim=0
+        )
+        scale_flip = torch.cat(
+            [scale[scale_half:], scale[:scale_half]], dim=0
+        )
+        torch.testing.assert_close(
+            quant_then_flip.view(torch.uint8),
+            flipped_then_quant.view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(scale_flip, flipped_scale_ref, rtol=0, atol=0)
+
+    def test_full_runner_gated_matches_plain(self):
+        from sglang.srt.layers.moe.moe_runner import (
+            flashinfer_sm120_fp8 as runner,
+        )
+
+        cases = ((1, 1), (8, 8), (128, 2))
+        for tokens, top_k in cases:
+            with self.subTest(tokens=tokens, top_k=top_k):
+                torch.manual_seed(37)
+                topk_ids = (
+                    torch.randint(
+                        0, 16, (tokens, top_k), device="cuda"
+                    ).to(torch.int32)
+                )
+                dispatch, config, plain_info, _, _ = _make_runner_case(
+                    tokens, top_k, topk_ids, seed=41, gated=False
+                )
+                _, _, gated_info, _, _ = _make_runner_case(
+                    tokens, top_k, topk_ids, seed=41, gated=True
+                )
+
+                with patch.object(
+                    runner, "_use_gated", return_value=False
+                ):
+                    plain_out = (
+                        runner.fused_experts_none_to_flashinfer_sm120_fp8(
+                            dispatch, plain_info, config
+                        ).hidden_states
+                    )
+                with patch.object(
+                    runner, "_use_gated", return_value=True
+                ):
+                    gated_out = (
+                        runner.fused_experts_none_to_flashinfer_sm120_fp8(
+                            dispatch, gated_info, config
+                        ).hidden_states
+                    )
+
+                full_diff = _calc_diff(gated_out, plain_out)
+                symmetric_diff = _calc_symmetric_diff(gated_out, plain_out)
+                normalized_rmse = _calc_normalized_rmse(gated_out, plain_out)
+                self.assertLess(full_diff, _FULL_MEAN_ABS_REL_TOL)
+                self.assertLess(symmetric_diff, _FULL_SYMMETRIC_DIFF_TOL)
+                self.assertLess(normalized_rmse, _FULL_NORMALIZED_RMSE_TOL)
+
+    def test_full_runner_gated_rejects_unflipped_weights(self):
+        from sglang.srt.layers.moe.moe_runner import (
+            flashinfer_sm120_fp8 as runner,
+        )
+
+        topk_ids = torch.randint(0, 16, (8, 2), device="cuda").to(torch.int32)
+        dispatch, config, plain_info, _, _ = _make_runner_case(
+            8, 2, topk_ids, gated=False
+        )
+        with patch.object(runner, "_use_gated", return_value=True):
+            with self.assertRaisesRegex(ValueError, "up-first w13 flip"):
+                runner.fused_experts_none_to_flashinfer_sm120_fp8(
+                    dispatch, plain_info, config
+                )
 
     def test_fused_swiglu_quant_pack_reused_outputs_clear_padding(self):
         from sglang.jit_kernel.activation import silu_and_mul

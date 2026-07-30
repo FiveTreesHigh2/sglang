@@ -10,6 +10,7 @@ import torch
 from sglang.jit_kernel.moe_permute_prepare import moe_permute_prepare
 from sglang.kernels.ops.moe.ep_moe_kernels import moe_permute, moe_unpermute
 from sglang.kernels.ops.moe.flashinfer_sm120_fp8 import (
+    fused_quant_pack_flashinfer_sm120_fp8,
     fused_quant_scatter_pack_flashinfer_sm120_fp8,
     fused_swiglu_quant_pack_flashinfer_sm120_fp8,
     pack_flashinfer_sm120_fp8_scale,
@@ -40,6 +41,7 @@ class FlashInferSm120Fp8MoeQuantInfo(MoeQuantInfo):
     w13_weight_scale_fi: torch.Tensor
     w2_weight_scale_fi: torch.Tensor
     block_shape: tuple[int, int]
+    w13_up_first: bool = False
 
 
 def prepare_flashinfer_sm120_fp8_weight_scales(
@@ -74,6 +76,16 @@ def _use_fused_a1() -> bool:
     logger.info(
         "flashinfer_sm120_fp8 A1 prepare mode=%s",
         "fused" if enabled else "legacy",
+    )
+    return enabled
+
+
+@functools.lru_cache(maxsize=1)
+def _use_gated() -> bool:
+    enabled = envs.SGLANG_FLASHINFER_SM120_FP8_GATED.get()
+    logger.info(
+        "flashinfer_sm120_fp8 GEMM1 mode=%s",
+        "gated (fused SwiGLU epilogue)" if enabled else "plain",
     )
     return enabled
 
@@ -177,6 +189,12 @@ def _validate_contract(
         raise ValueError(
             "flashinfer_sm120_fp8 supports gated SiLU/SwiGLU only"
         )
+    if _use_gated() != quant_info.w13_up_first:
+        raise ValueError(
+            "flashinfer_sm120_fp8 gated mode and the up-first w13 flip must "
+            "agree: gated GEMM1 on unflipped weights (or vice versa) would "
+            "silently swap gate/up halves"
+        )
     if runner_config.apply_router_weight_on_input:
         raise ValueError("apply_router_weight_on_input is not supported")
     if runner_config.no_combine:
@@ -217,6 +235,7 @@ def _run_grouped_gemm(
     b_scale: torch.Tensor,
     m_indptr: torch.Tensor,
     out: torch.Tensor,
+    is_gated: bool = False,
 ) -> None:
     result = _target_grouped_gemm()(
         a,
@@ -229,6 +248,7 @@ def _run_grouped_gemm(
         backend="cute",
         out=out,
         out_dtype=torch.bfloat16,
+        is_gated=is_gated,
     )
     if not isinstance(result, torch.Tensor) or result.data_ptr() != out.data_ptr():
         raise RuntimeError(
@@ -290,9 +310,13 @@ def fused_experts_none_to_flashinfer_sm120_fp8(
             source_is_packed=False,
         )
 
+    use_gated = _use_gated()
+    gate_up_dim = quant_info.w13_weight.shape[1]
+    if use_gated:
+        gate_up_dim //= 2
     gate_up = torch.empty(
         packed_hidden.shape[0],
-        quant_info.w13_weight.shape[1],
+        gate_up_dim,
         device=hidden_states.device,
         dtype=torch.bfloat16,
     )
@@ -303,14 +327,23 @@ def fused_experts_none_to_flashinfer_sm120_fp8(
         quant_info.w13_weight_scale_fi,
         m_indptr,
         gate_up,
+        is_gated=use_gated,
     )
 
-    down_input, a2_scale_fi = fused_swiglu_quant_pack_flashinfer_sm120_fp8(
-        gate_up,
-        topk_ids,
-        src2dst,
-        m_indptr,
-    )
+    if use_gated:
+        down_input, a2_scale_fi = fused_quant_pack_flashinfer_sm120_fp8(
+            gate_up,
+            topk_ids,
+            src2dst,
+            m_indptr,
+        )
+    else:
+        down_input, a2_scale_fi = fused_swiglu_quant_pack_flashinfer_sm120_fp8(
+            gate_up,
+            topk_ids,
+            src2dst,
+            m_indptr,
+        )
     down_output = torch.empty(
         packed_hidden.shape[0],
         quant_info.w2_weight.shape[1],

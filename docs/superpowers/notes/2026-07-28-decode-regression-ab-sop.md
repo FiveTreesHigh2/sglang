@@ -59,6 +59,10 @@ nsys launch --session-new=dec-ab-A \
     --moe-runner-backend flashinfer_sm120_fp8 \
     --enable-layerwise-nvtx-marker \
     > /home/logs/sennian/nsys-log/dec-ab-A/server.log 2>&1 &
+
+nsys launch --session-new=dec-ab-A      --trace=cuda,nvtx,osrt --cuda-graph-trace=node   python3 -m sglang.launch_server     --served-model-name alimama-public-llm-service-qwen3.5-35a3-fp8-test-pro5000.default.0     --model-path /home/admin/hippo/worker/slave/alimama-public-llm-service-qwen3.5-35a3-fp8-test_alimama-public-llm-service-qwen3.5-35a3-fp8-test-pro5000.default.0_S179908_48_66/suez_worker/runtimedata/cantor/lm_data_Qwen3_5-35B-A3B-FP8/generation_1776070802/partition_0_65535/suez_data/     --host 33.243.206.227 --port 30000     --enable-metrics --tp-size=1     --reasoning-parser=qwen3 --collect-tokens-histogram --tool-call-parser=qwen3_coder     --disable-radix-cache --mem-fraction-static 0.9     --fp8-gemm-backend flashinfer_cutlass          --enable-layerwise-nvtx-marker
+
+nsys launch --session-new=dec-ab-A   --env-var=SGLANG_GDN_CHUNK_H_BV=64,SGLANG_GDN_CHUNK_H_NUM_WARPS=4,SGLANG_GDN_CHUNK_H_NUM_STAGES=2,SGLANG_GDN_WU_BK=128,SGLANG_GDN_WU_BV=128,SGLANG_GDN_WU_NUM_STAGES=3,SGLANG_FLASHINFER_SM120_FP8_FUSED_A1=0   --trace=cuda,nvtx,osrt --cuda-graph-trace=node   /home/logs/sennian/pro5000-fi-moe/.venv/bin/python3 -m sglang.launch_server     --served-model-name alimama-public-llm-service-qwen3.5-35a3-fp8-test-pro5000.default.0     --model-path /home/admin/hippo/worker/slave/alimama-public-llm-service-qwen3.5-35a3-fp8-test_alimama-public-llm-service-qwen3.5-35a3-fp8-test-pro5000.default.0_S179908_48_66/suez_worker/runtimedata/cantor/lm_data_Qwen3_5-35B-A3B-FP8/generation_1776070802/partition_0_65535/suez_data/     --host 33.243.206.227 --port 30000     --enable-metrics --tp-size=1     --reasoning-parser=qwen3 --collect-tokens-histogram --tool-call-parser=qwen3_coder     --disable-radix-cache --mem-fraction-static 0.9     --fp8-gemm-backend flashinfer_cutlass     --moe-runner-backend flashinfer_sm120_fp8     --enable-layerwise-nvtx-marker
 ```
 
 注意：
@@ -107,20 +111,20 @@ ls -lt /home/logs/sennian/nsys-log/dec-ab-A/
 ### 第 5 步：导出与判读
 
 ```bash
-nsys stats -r cuda_gpu_kern_sum /home/logs/sennian/nsys-log/dec-ab-A/report1.nsys-rep --format csv \
-  > /home/logs/sennian/nsys-log/dec-ab-A/kern_sum.csv
+nsys stats -r cuda_gpu_kern_sum report1.nsys-rep --format csv \
+  > kern_sum.csv
 
 # 步数锚点：qkvzba 融合 kernel 仅 decode 路径运行、每步 30 次（30 GDN 层）
 # steps = instances / 30
-grep "qkvzba" /home/logs/sennian/nsys-log/dec-ab-A/kern_sum.csv
+grep "qkvzba" kern_sum.csv
 
 # per-step GPU 总量 = 总 kernel 时长 / steps
 awk -F, 'NR>1 && $2 ~ /^[0-9]+$/ {s+=$2} END {printf "total_kernel_ms=%.1f\n", s/1e6}' \
-  /home/logs/sennian/nsys-log/dec-ab-A/kern_sum.csv
+  kern_sum.csv
 
 # MoE 相关条目（A/C 组看 FI 家族，B 组看 fused_moe_kernel 家族）
 grep -iE "quant_scatter|swiglu_quant|unpermute|moe_permute|cute|fused_moe|moe_sum|moe_align" \
-  /home/logs/sennian/nsys-log/dec-ab-A/kern_sum.csv
+  kern_sum.csv
 ```
 
 判读口径：
@@ -142,3 +146,68 @@ nsys sessions list
 - A−C 显著（>0.2ms/step）→ H2 有份额；FUSED_A1 改为仅 prefill 启用是低成本修复
 - A−B 明显小于 1.1ms → 残差在 MoE 之外，追加 kern_sum 全量 diff（B14/B3/守卫逐项排查）
 - 全组不显著但 TPOT 差仍在 → host/launch 侧问题（graph replay 间隙），改用 nsys osrt + cuda API trace 立案
+
+---
+
+## 2026-07-29 归因结论与调度器修复验收清单
+
+### 归因结果（bs=1，output 4096，干净窗口）
+
+| 类目/步 | A (FI) | B (Triton) | Δ |
+|---|---|---|---|
+| MoE GEMM | 1.905ms (80×23.8μs) | 1.181ms (80×13.3μs + align) | +0.72ms |
+| dense GEMM | 3.452ms | 3.718ms | -0.27ms |
+| 总 kernel | 8.35ms | 7.72ms | +0.63ms |
+
+- H1 半成立：FI ZeroPadding 调度器每 launch ~24μs 地板价（`scheduler.cuh` 线性扫 256 expert × 5 个 Scheduler 实例/block），占回退六成；H2（FUSED_A1）证伪（A≈C）
+- bs=128 时 A/B 打平（58.65 vs 57.97ms TPOT）——扫描被真实工作摊薄，与全量 sweep 一致
+- 残差 ~0.4-0.5ms 未归因（需 D 组：基线 pip 环境同口径）
+
+### 修复：flashinfer `zero-padding-sched-fix` 分支（commit 56108d32）
+
+smem tile-cumsum 协作预计算 + 二分查找，枚举顺序逐位不变。改动：`sm120_common/scheduler.cuh`、`sm120_blockscaling/kernel_impl.cuh`、`tests/grouped_mm/test_cute_sm120_fp8.py`（新增 256-expert 稀疏路由 case）。
+
+### 服务器部署（fork + git URL，pure-python wheel 秒装）
+
+```bash
+# 安装（fork 推送后）
+/home/logs/sennian/pro5000-fi-moe/.venv/bin/uv pip install --force-reinstall --no-deps \
+  "git+https://github.com/FiveTreesHigh2/flashinfer@zero-padding-sched-fix"
+# JIT 预热 + 校验
+/home/logs/sennian/pro5000-fi-moe/.venv/bin/python3 sglang/scripts/pro5000/flashinfer_sm120_fp8_smoke.py
+# 回滚 = bootstrap_stage_b.sh 内 pinned 官方 wheel 重装
+```
+
+### 验收序列（任一步失败即停）
+
+1. `pytest tests/grouped_mm/test_cute_sm120_fp8.py -v`（含新增 `many_experts_sparse` 两 case）
+2. `test/registered/moe/test_flashinfer_sm120_fp8_moe.py`（逐位 glue + full runner 三指标 + CUDA graph 一致性）
+3. kernel microbench：`benchmark_flashinfer_sm120_fp8_moe.py --cum-m 8`、`--cum-m 64`（预期 24μs → ≤13μs）；`--cum-m 65536` prefill 哨兵（允差噪声级）
+4. E2E decode：本 SOP A 组重跑，MoE GEMM per-step 预期 1.905 → ≤1.2ms，TPOT 回落 ~0.6ms
+5. E2E prefill spot-check：4096 输入吞吐 ±1%
+6. 精度 smoke（可选）：`python3 -m sglang.test.run_eval --eval-name gsm8k --num-examples 20`
+
+### 2026-07-29 验收结果（全部通过）
+
+- 修复分支最终 commit：`c7bf5278`（56108d32 的 static smem 对齐 bug 修复：表并入动态 SharedStorage，static __shared__ 会破坏 TMA 128B 对齐 → cudaErrorMisalignedAddress）
+- 部署方式：因服务器无法直连 GitHub（子模块 clone 失败），实际用文件覆盖 site-packages/flashinfer/data/csrc/（内容与 c7bf5278 一致）；正规化（fork wheel/Release/bootstrap SHA256）待补
+- kernel microbench（锁频 1732MHz）：
+  - decode：cum_m=8 FI 24μs → **5.7~9.4μs**（vs Triton 20μs，反超 2.2~3.6×）；数值与 Triton **逐位一致**（triton_vs_flashinfer=0.0）
+  - prefill 哨兵 cum_m=65536：四 case 相对改前 -1.3% ~ +1.2%，±2% 门限内（不锁频对比会因 boost 行为差异漂 ±10%，勿用）
+- E2E decode bs=1（input 4096/output 2048）：TPOT **7.45 → 6.51ms**（基线 6.33，残差 +0.18ms，不再立案）；prefill spot-check 与精度 smoke 正常
+- 已知未了：
+  - `test_full_runner_uses_single_fused_a2_prepare` 是 B13 旧账（未 patch `_use_fused_a1`，默认翻转后必挂），与本修复无关，待修
+  - **上游 PR 4130 已 merge（2026-07-29，含 fp8+mxfp8）**：调度器重写（MoeScheduler：专职调度 warp + shfl prefix-sum/ballot + smem 管道发布，完全替代我们的补丁）+ `is_gated` fused SwiGLU（prefill MPE=1024 +34.3%）。我们自己的上游 PR 计划取消。
+  - **合入计划（等含 #4130 的 nightly wheel）**：
+    - 档 A（先做）：切官方 nightly。sglang 零代码改动（API 向后兼容，is_gated 默认 False）；改 `pyproject.toml:34` pin + `bootstrap_stage_b.sh:12-14` URL/SHA256；废弃 overlay 与 fork 分支。验收组合拳全跑：锁频 microbench（cum-m 8/64/65536）+ 逐位对照 + CUDA graph 一致性 + E2E decode/prefill + nightly churn 的 attention/GDN spot-check（~1 天）
+    - 档 B（另行排期，2-4 天）：接入 is_gated。关键点：w13 权重布局需重排为 up 前 gate 后（load 时一次性）；`fused_swiglu_quant_pack` 瘦身为纯 quant+pack（silu 由 epilogue 接管，半替代非删除）；gate_up buffer 减半；逐位测试按新分工重写；精度门（三指标 + GSM8K/MMLU，epilogue 激活与现路径非逐位一致）
+    - 后续上游方向：is_gated + epilogue 直出 fp8（审计项 -3.1ms 的顺路实现），可让 A2 kernel 整个消失
+
+### 2026-07-29 档 A 完成（提前启动，未等 nightly）
+
+- 方式：cherry-pick #4130（merge commit 92274ba1）到 pinned tag `b35396c1`，零冲突；依赖核查：97 个中间 commit 仅 #4185 触碰相关路径且只改 cuDNN 测试标记，PR 引用符号在 tag 上全部存在。分支 `adopt-pr4130`（`55b030f3`，含我们移植的 256-expert 稀疏 case ×4）已推 fork。部署仍走文件覆盖（27 文件含 2 个 Python core.py——op 绑定加了 is_gated 参数）
+- 验收：flashinfer 单测 47/47 全绿（含 gated）；sglang MoE 测试 1 failed（B13 旧账，与合入前分布一致）15 passed；smoke 数值不变
+- microbench（锁频 1732）：prefill 65536 相对我们补丁版再降 **4.3~12.4%**（gemm2 uniform 595→525μs）——专职调度 warp 管道卸掉了消费者 warp 的调度负担，prefill 也受益；decode cum_m=8 8.2~13.7μs（与我们补丁版 5.7~9.4μs 不可比：那批未锁频）
+- E2E：prefill @4096 **37405 tok/s**（我们补丁版 36708，baseline 32372，**累计 +15.5%**）；decode bs=1 TPOT **6.45ms**（我们补丁版 6.51，baseline 6.18）
+- decode 残差 +0.27ms 结构：FI glue 溢价 ~0.17ms（A/B 组"其余全部"差值，GEMM 前后 sglang kernel 的个数地板）+ 新 build 全局项 ~0.1ms（B14/B3/守卫），随档 B 及后续融合蚕食，不单独立案
+- 尾巴：等含 #4130 的官方 nightly 发布后切 pinned wheel 完成正规化（pyproject:34 + bootstrap:12-14）

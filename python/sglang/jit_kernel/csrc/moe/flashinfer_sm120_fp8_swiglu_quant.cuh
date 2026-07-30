@@ -43,7 +43,7 @@ SGL_DEVICE fp32x2_t flashinfer_sm120_fp8_silu_and_mul(bf16x2_t gate, bf16x2_t up
   return cast<fp32x2_t>(rounded);
 }
 
-template <bool kUsePDL>
+template <bool kUsePDL, bool kInputActivated>
 __global__ __launch_bounds__(1024, 2) void flashinfer_sm120_fp8_silu_quant_pack_kernel(
     const FlashInferSm120Fp8SiluQuantPackParams __grid_constant__ params) {
   using namespace device;
@@ -71,30 +71,44 @@ __global__ __launch_bounds__(1024, 2) void flashinfer_sm120_fp8_silu_quant_pack_
     const uint32_t expert_start = params.m_indptr[expert];
     const uint32_t aligned_start = ((expert_start + 3u * expert) / 4u) * 4u;
     const uint32_t scale_col = aligned_start + dst - expert_start;
-    const auto input = params.input + static_cast<int64_t>(dst) * params.hidden_dim * 2;
+    const auto input = params.input +
+        static_cast<int64_t>(dst) * params.hidden_dim * (kInputActivated ? 1 : 2);
     const auto output = params.output + static_cast<int64_t>(dst) * params.hidden_dim;
 
     const uint32_t work_id = threadIdx.x / kWorkThreads;
     const uint32_t lane_in_work = threadIdx.x % kWorkThreads;
     const bool valid_group = work_id < num_groups;
     const uint32_t vector_id = work_id * kWorkThreads + lane_in_work;
-    const uint32_t vectors_per_half = params.hidden_dim / 8u;
 
     OutputVec out_vec;
     float scale = 0.0f;
     if (valid_group) {
-      InputVec gate_vec, up_vec;
-      gate_vec.load(input, vector_id);
-      up_vec.load(input, vector_id + vectors_per_half);
-
       float local_max = 1e-10f;
       float results[8];
+      if constexpr (kInputActivated) {
+        // Input already holds SiLU(gate)*up (FlashInfer is_gated GEMM1
+        // epilogue); this kernel degenerates to quant + scale pack.
+        InputVec act_vec;
+        act_vec.load(input, vector_id);
 #pragma unroll
-      for (uint32_t i = 0; i < 4; ++i) {
-        const auto [x, y] = flashinfer_sm120_fp8_silu_and_mul(gate_vec[i], up_vec[i]);
-        results[2 * i] = x;
-        results[2 * i + 1] = y;
-        local_max = fmaxf(local_max, fmaxf(fabsf(x), fabsf(y)));
+        for (uint32_t i = 0; i < 4; ++i) {
+          const auto [x, y] = cast<fp32x2_t>(act_vec[i]);
+          results[2 * i] = x;
+          results[2 * i + 1] = y;
+          local_max = fmaxf(local_max, fmaxf(fabsf(x), fabsf(y)));
+        }
+      } else {
+        const uint32_t vectors_per_half = params.hidden_dim / 8u;
+        InputVec gate_vec, up_vec;
+        gate_vec.load(input, vector_id);
+        up_vec.load(input, vector_id + vectors_per_half);
+#pragma unroll
+        for (uint32_t i = 0; i < 4; ++i) {
+          const auto [x, y] = flashinfer_sm120_fp8_silu_and_mul(gate_vec[i], up_vec[i]);
+          results[2 * i] = x;
+          results[2 * i + 1] = y;
+          local_max = fmaxf(local_max, fmaxf(fabsf(x), fabsf(y)));
+        }
       }
 
       constexpr uint32_t kWorkMask = (1u << kWorkThreads) - 1u;
@@ -160,9 +174,9 @@ __global__ __launch_bounds__(1024, 2) void flashinfer_sm120_fp8_silu_quant_pack_
 
 }  // namespace
 
-template <bool kUsePDL>
+template <bool kUsePDL, bool kInputActivated>
 struct FlashInferSm120Fp8SiluQuantPackKernel {
-  static constexpr auto kernel = flashinfer_sm120_fp8_silu_quant_pack_kernel<kUsePDL>;
+  static constexpr auto kernel = flashinfer_sm120_fp8_silu_quant_pack_kernel<kUsePDL, kInputActivated>;
 
   static void
   run(const tvm::ffi::TensorView gate_up,
@@ -191,7 +205,11 @@ struct FlashInferSm120Fp8SiluQuantPackKernel {
     TensorMatcher({M}).with_dtype<int32_t>().with_device(device).verify(src2dst);
     TensorMatcher({EP}).with_dtype<int32_t>().with_device(device).verify(m_indptr);
 
-    RuntimeCheck(D.unwrap() == 2 * N.unwrap(), "gate_up last dim must be 2 * output last dim");
+    if constexpr (kInputActivated) {
+      RuntimeCheck(D.unwrap() == N.unwrap(), "activated input last dim must equal output last dim");
+    } else {
+      RuntimeCheck(D.unwrap() == 2 * N.unwrap(), "gate_up last dim must be 2 * output last dim");
+    }
     RuntimeCheck(N.unwrap() > 0 && N.unwrap() % 128 == 0, "hidden_dim must be positive and divisible by 128");
     RuntimeCheck(T.unwrap() * K.unwrap() == M.unwrap(), "topk_ids must contain one entry per routed row");
     RuntimeCheck(K.unwrap() > 0, "top_k must be positive");

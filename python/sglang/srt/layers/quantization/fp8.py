@@ -2062,9 +2062,31 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
 
         if get_moe_runner_backend().is_flashinfer_sm120_fp8():
+            from sglang.srt.environ import envs as _sm120_envs
             from sglang.srt.layers.moe.moe_runner.flashinfer_sm120_fp8 import (
                 prepare_flashinfer_sm120_fp8_weight_scales,
             )
+
+            if _sm120_envs.SGLANG_FLASHINFER_SM120_FP8_GATED.get():
+                # The FlashInfer is_gated GEMM packs up in columns [0, N) and
+                # gate in [N, 2N); sglang loads w13 as [gate; up], so flip the
+                # halves (weight and blockwise scales stay in lockstep) once
+                # at load time.
+                w13 = layer.w13_weight.data
+                w13_scale = layer.w13_weight_scale_inv.data
+                if w13.shape[1] % 2 or w13_scale.shape[1] % 2:
+                    raise ValueError(
+                        "flashinfer_sm120_fp8 gated mode requires even gate/up halves"
+                    )
+                half = w13.shape[1] // 2
+                scale_half = w13_scale.shape[1] // 2
+                w13.copy_(torch.cat([w13[:, half:], w13[:, :half]], dim=1))
+                w13_scale.copy_(
+                    torch.cat(
+                        [w13_scale[:, scale_half:], w13_scale[:, :scale_half]], dim=1
+                    )
+                )
+                layer.w13_up_first = True
 
             w13_scale_fi, w2_scale_fi = (
                 prepare_flashinfer_sm120_fp8_weight_scales(
@@ -2392,6 +2414,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13_weight_scale_fi=layer.w13_weight_scale_fi,
                 w2_weight_scale_fi=layer.w2_weight_scale_fi,
                 block_shape=tuple(self.weight_block_size),
+                w13_up_first=getattr(layer, "w13_up_first", False),
             )
         elif self.runner.runner_backend.is_deep_gemm():
 
