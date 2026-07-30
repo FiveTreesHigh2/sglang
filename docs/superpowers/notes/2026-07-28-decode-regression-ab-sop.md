@@ -210,7 +210,7 @@ smem tile-cumsum 协作预计算 + 二分查找，枚举顺序逐位不变。改
 - 关键教训：**plain 路径的 silu 早已融合进 A2（当年 A2 融合），本次融合的增量收益大半已被提前吃掉**；上游 +34.3% 是对未融合基线、MPE=1024 的 GEMM 单体口径
 - E2E：prefill 37558（+0.4%）；decode bs=1 6.48ms、bs=128 58.49ms（均噪声级）——microbench 担心的 decode +0.18ms 被生产 graph 的 PDL/重叠遮蔽，未兑现
 - 精度：gated vs plain 数值差 ~0.7% mean-rel（silu 位置：fp32 accum vs bf16 舍入后），单测/stage-2 设 gated 容差带（2e-2/2e-3/3e-2），上游同类先例 2e-3
-- **精度门未闭环（待补）**：GSM8K on-side 131 题 0.832 已录；缺同命令 env-off 对照 + MMLU 双侧。默认开启为用户决策，正式签字前生产灰度需知悉
+- **精度门已闭环（2026-07-30 用户确认签字）**：on-side GSM8K 131 题 0.832、MMLU 200 题 0.680（stem 0.643 / humanities 0.565 / social 0.735 / other 0.809）；与基线对照由用户确认无差异。默认开启生效
 - commit 链：201376dfa → dc23ad0a2 → ad0f50f4f → c72a77980 → eb4d5a896 → 30556a793 → （env 默认翻转）
 
 ### decode 后续优化路线（登记）
