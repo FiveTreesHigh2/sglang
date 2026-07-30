@@ -203,6 +203,24 @@ smem tile-cumsum 协作预计算 + 二分查找，枚举顺序逐位不变。改
     - 档 B（另行排期，2-4 天）：接入 is_gated。关键点：w13 权重布局需重排为 up 前 gate 后（load 时一次性）；`fused_swiglu_quant_pack` 瘦身为纯 quant+pack（silu 由 epilogue 接管，半替代非删除）；gate_up buffer 减半；逐位测试按新分工重写；精度门（三指标 + GSM8K/MMLU，epilogue 激活与现路径非逐位一致）
     - 后续上游方向：is_gated + epilogue 直出 fp8（审计项 -3.1ms 的顺路实现），可让 A2 kernel 整个消失
 
+### 2026-07-30 档 B 收尾（is_gated 默认开启）
+
+- 实现：`SGLANG_FLASHINFER_SM120_FP8_GATED`（现默认 True）；w13 load 后翻转为 up-first（fp8.py，B4 挂点）；A2 kernel 加 `kInputActivated` 退化为纯 quant+pack；runner 契约断言堵死翻转/env 错配；stage-2 bench 支持 `a1_fused_gated` 路径与 gated 容差带
+- 组件归因（stage-2，t=1/8192）：decode gemm1 +5.3μs vs A2 -5.2μs（graph 下净 +4.4μs/层——上游 gated kernel 小 M 配对税）；prefill 净 -56μs/层（主要来自 A2 免 silu -40μs，store 减半仅 -16μs：compute-bound）
+- 关键教训：**plain 路径的 silu 早已融合进 A2（当年 A2 融合），本次融合的增量收益大半已被提前吃掉**；上游 +34.3% 是对未融合基线、MPE=1024 的 GEMM 单体口径
+- E2E：prefill 37558（+0.4%）；decode bs=1 6.48ms、bs=128 58.49ms（均噪声级）——microbench 担心的 decode +0.18ms 被生产 graph 的 PDL/重叠遮蔽，未兑现
+- 精度：gated vs plain 数值差 ~0.7% mean-rel（silu 位置：fp32 accum vs bf16 舍入后），单测/stage-2 设 gated 容差带（2e-2/2e-3/3e-2），上游同类先例 2e-3
+- **精度门未闭环（待补）**：GSM8K on-side 131 题 0.832 已录；缺同命令 env-off 对照 + MMLU 双侧。默认开启为用户决策，正式签字前生产灰度需知悉
+- commit 链：201376dfa → dc23ad0a2 → ad0f50f4f → c72a77980 → eb4d5a896 → 30556a793 → （env 默认翻转）
+
+### decode 后续优化路线（登记）
+
+1. 重建预算表：修复后 build 重采 A 组 nsys，校准 dense/MoE/GDN 各类目 per-step
+2. dense GEMM 小 M 调优（~3.4ms/step 大头，粗算距 roofline ~2×；ncu 定位 + FI dense 小 M tile config，潜在 -0.5~1ms）
+3. MoE glue 融合双子星（上游对齐）：epilogue 直出 fp8（A2 消失）+ unpermute 进 GEMM2 FINALIZE；做完 gated 在 decode 也翻正
+4. 残差清尾：B14 已由 18af088bd revert；B3/守卫 ~0.05-0.1ms 待 D 组归因定夺
+5. 算法级：投机解码（MTP/EAGLE）为 bs=1 的数量级杠杆，另立项目
+
 ### 2026-07-29 档 A 完成（提前启动，未等 nightly）
 
 - 方式：cherry-pick #4130（merge commit 92274ba1）到 pinned tag `b35396c1`，零冲突；依赖核查：97 个中间 commit 仅 #4185 触碰相关路径且只改 cuDNN 测试标记，PR 引用符号在 tag 上全部存在。分支 `adopt-pr4130`（`55b030f3`，含我们移植的 256-expert 稀疏 case ×4）已推 fork。部署仍走文件覆盖（27 文件含 2 个 Python core.py——op 绑定加了 is_gated 参数）

@@ -967,8 +967,9 @@ class Envs:
     SGLANG_FLASHINFER_SM120_FP8_FUSED_A1 = EnvBool(True)
     # Gated (fused SwiGLU) GEMM1 for the SM120 FP8 MoE runner: SiLU(gate)*up
     # runs in the FlashInfer GEMM epilogue (requires up-first w13 layout,
-    # flipped at load time). Off until the accuracy gate signs off.
-    SGLANG_FLASHINFER_SM120_FP8_GATED = EnvBool(False)
+    # flipped at load time). E2E on RTX PRO 5000: prefill +0.4%, decode
+    # neutral; GSM8K smoke 0.832 (on-side).
+    SGLANG_FLASHINFER_SM120_FP8_GATED = EnvBool(True)
     SGLANG_OPT_USE_BF16_ROUTER_GEMM = EnvBool(True)
     SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
     SGLANG_DISABLE_MSA = EnvBool(False)
