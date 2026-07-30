@@ -53,6 +53,16 @@ FUSED_A1_A2_COMPONENT_DETAIL_KEYS = frozenset(
         "unpermute_combine",
     )
 )
+FUSED_A1_GATED_COMPONENT_DETAIL_KEYS = frozenset(
+    (
+        "moe_permute_prepare",
+        "fused_quant_scatter_pack_gemm1",
+        "gemm1",
+        "fused_quant_pack_gemm2",
+        "gemm2",
+        "unpermute_combine",
+    )
+)
 COMPONENT_ROLLUP_KEYS = (
     "gemm1_input_prepare",
     "gemm1",
@@ -88,7 +98,16 @@ A1_FUSED_A2_FUSED_COMPONENT_TRACE = (
     "gemm2",
     "unpermute_combine",
 )
+A1_FUSED_GATED_COMPONENT_TRACE = (
+    "moe_permute_prepare",
+    "fused_quant_scatter_pack_gemm1",
+    "gemm1",
+    "fused_quant_pack_gemm2",
+    "gemm2",
+    "unpermute_combine",
+)
 A1_LEGACY_A2_LEGACY_COMPONENT_CALL_COUNTS = {
+    "fused_a2_gated": 0,
     "quant": 2,
     "pack": 2,
     "gemm": 2,
@@ -100,6 +119,7 @@ A1_LEGACY_A2_LEGACY_COMPONENT_CALL_COUNTS = {
     "fused_a2": 0,
 }
 A1_LEGACY_A2_FUSED_COMPONENT_CALL_COUNTS = {
+    "fused_a2_gated": 0,
     "quant": 1,
     "pack": 1,
     "gemm": 2,
@@ -111,6 +131,7 @@ A1_LEGACY_A2_FUSED_COMPONENT_CALL_COUNTS = {
     "fused_a2": 1,
 }
 A1_FUSED_A2_FUSED_COMPONENT_CALL_COUNTS = {
+    "fused_a2_gated": 0,
     "quant": 0,
     "pack": 0,
     "gemm": 2,
@@ -120,6 +141,18 @@ A1_FUSED_A2_FUSED_COMPONENT_CALL_COUNTS = {
     "silu": 0,
     "fused_a1": 1,
     "fused_a2": 1,
+}
+A1_FUSED_GATED_COMPONENT_CALL_COUNTS = {
+    "fused_a2_gated": 1,
+    "quant": 0,
+    "pack": 0,
+    "gemm": 2,
+    "moe_permute": 0,
+    "prepare": 1,
+    "unpermute": 1,
+    "silu": 0,
+    "fused_a1": 1,
+    "fused_a2": 0,
 }
 FULL_MEAN_ABS_REL_TOL = 5e-3
 FULL_SYMMETRIC_DIFF_TOL = 1e-4
@@ -336,6 +369,16 @@ def build_component_profile(detail_ms: dict[str, float]) -> dict[str, Any]:
         gemm2_input_prepare = detail_ms[
             "fused_swiglu_quant_pack_gemm2"
         ]
+    elif keys == FUSED_A1_GATED_COMPONENT_DETAIL_KEYS:
+        path = "a1_fused_gated"
+        gemm1_input_prepare = sum(
+            detail_ms[key]
+            for key in (
+                "moe_permute_prepare",
+                "fused_quant_scatter_pack_gemm1",
+            )
+        )
+        gemm2_input_prepare = detail_ms["fused_quant_pack_gemm2"]
     elif keys == FUSED_A1_A2_COMPONENT_DETAIL_KEYS:
         path = "a1_fused_a2_fused"
         gemm1_input_prepare = sum(
@@ -381,6 +424,9 @@ def validate_component_trace(
     elif normalized_trace == A1_FUSED_A2_FUSED_COMPONENT_TRACE:
         path = "a1_fused_a2_fused"
         expected_counts = A1_FUSED_A2_FUSED_COMPONENT_CALL_COUNTS
+    elif normalized_trace == A1_FUSED_GATED_COMPONENT_TRACE:
+        path = "a1_fused_gated"
+        expected_counts = A1_FUSED_GATED_COMPONENT_CALL_COUNTS
     else:
         raise ValueError(
             "component call trace does not match a supported runner path: "
@@ -991,6 +1037,7 @@ def profile_flashinfer_components(
         "silu": 0,
         "fused_a1": 0,
         "fused_a2": 0,
+        "fused_a2_gated": 0,
     }
     iteration_trace: list[str] = []
     observed_path: str | None = None
@@ -1070,6 +1117,11 @@ def profile_flashinfer_components(
             "fused_swiglu_quant_pack_flashinfer_sm120_fp8",
             None,
         ),
+        "fused_a2_gated": getattr(
+            flashinfer_runner,
+            "fused_quant_pack_flashinfer_sm120_fp8",
+            None,
+        ),
     }
     with ExitStack() as stack:
         stack.enter_context(
@@ -1145,6 +1197,18 @@ def profile_flashinfer_components(
                         "fused_swiglu_quant_pack_gemm2",
                         "fused_a2",
                         originals["fused_a2"],
+                    ),
+                )
+            )
+        if originals["fused_a2_gated"] is not None:
+            stack.enter_context(
+                patch.object(
+                    flashinfer_runner,
+                    "fused_quant_pack_flashinfer_sm120_fp8",
+                    recorded(
+                        "fused_quant_pack_gemm2",
+                        "fused_a2_gated",
+                        originals["fused_a2_gated"],
                     ),
                 )
             )
