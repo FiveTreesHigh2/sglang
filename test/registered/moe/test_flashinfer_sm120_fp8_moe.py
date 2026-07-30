@@ -199,8 +199,12 @@ def _run_flashinfer_with_stage_diagnostics(dispatch, config, quant_info):
     diagnostics = []
     original_grouped_gemm = flashinfer_runner._run_grouped_gemm
 
-    def recording_grouped_gemm(a, b, a_scale, b_scale, m_indptr, out):
-        original_grouped_gemm(a, b, a_scale, b_scale, m_indptr, out)
+    def recording_grouped_gemm(a, b, a_scale, b_scale, m_indptr, out, is_gated=False):
+        original_grouped_gemm(a, b, a_scale, b_scale, m_indptr, out, is_gated=is_gated)
+        if is_gated:
+            # The fp32 dense reference models the plain GEMM only; gated
+            # correctness is covered by test_full_runner_gated_matches_plain.
+            return
         reference = _grouped_fp32_reference(
             a,
             b,
