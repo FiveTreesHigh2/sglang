@@ -10,6 +10,7 @@ import torch
 from sglang.jit_kernel.moe_permute_prepare import moe_permute_prepare
 from sglang.kernels.ops.moe.ep_moe_kernels import moe_permute, moe_unpermute
 from sglang.kernels.ops.moe.flashinfer_sm120_fp8 import (
+    build_finalize_metadata_flashinfer_sm120_fp8,
     fused_quant_pack_flashinfer_sm120_fp8,
     fused_quant_scatter_pack_flashinfer_sm120_fp8,
     fused_swiglu_quant_pack_flashinfer_sm120_fp8,
@@ -86,6 +87,16 @@ def _use_gated() -> bool:
     logger.info(
         "flashinfer_sm120_fp8 GEMM1 mode=%s",
         "gated (fused SwiGLU epilogue)" if enabled else "plain",
+    )
+    return enabled
+
+
+@functools.lru_cache(maxsize=1)
+def _use_finalize() -> bool:
+    enabled = envs.SGLANG_FLASHINFER_SM120_FP8_MOE_FINALIZE.get()
+    logger.info(
+        "flashinfer_sm120_fp8 GEMM2 store mode=%s",
+        "finalize (fused unpermute+combine)" if enabled else "packed",
     )
     return enabled
 
@@ -236,7 +247,19 @@ def _run_grouped_gemm(
     m_indptr: torch.Tensor,
     out: torch.Tensor,
     is_gated: bool = False,
+    finalize: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
+    kwargs = {}
+    expected = out
+    if finalize is not None:
+        finalize_out, dst2token, row_weights = finalize
+        kwargs = dict(
+            finalize_out=finalize_out,
+            finalize_dst2token=dst2token,
+            finalize_row_weights=row_weights,
+        )
+        expected = finalize_out
+        out = None
     result = _target_grouped_gemm()(
         a,
         b,
@@ -249,8 +272,9 @@ def _run_grouped_gemm(
         out=out,
         out_dtype=torch.bfloat16,
         is_gated=is_gated,
+        **kwargs,
     )
-    if not isinstance(result, torch.Tensor) or result.data_ptr() != out.data_ptr():
+    if not isinstance(result, torch.Tensor) or result.data_ptr() != expected.data_ptr():
         raise RuntimeError(
             "FlashInfer SM120 grouped GEMM did not reuse the supplied output"
         )
@@ -344,6 +368,40 @@ def fused_experts_none_to_flashinfer_sm120_fp8(
             src2dst,
             m_indptr,
         )
+    num_experts = quant_info.w2_weight.shape[0]
+    use_finalize = (
+        _use_finalize()
+        # Mirror the FlashInfer SwapAB tile rule conservatively; the FI runner
+        # hard-errors if a finalize request ever lands on another tile path.
+        and topk_ids.numel() // num_experts <= 8
+        and quant_info.w2_weight.shape[1] % 128 == 0
+    )
+    if use_finalize:
+        dst2token, row_weights = build_finalize_metadata_flashinfer_sm120_fp8(
+            topk_ids,
+            topk_weights,
+            src2dst,
+            routed_scaling_factor=runner_config.routed_scaling_factor,
+        )
+        finalize_out = torch.zeros(
+            hidden_states.shape[0],
+            quant_info.w2_weight.shape[1],
+            device=hidden_states.device,
+            dtype=torch.float32,
+        )
+        _run_grouped_gemm(
+            down_input,
+            quant_info.w2_weight,
+            a2_scale_fi,
+            quant_info.w2_weight_scale_fi,
+            m_indptr,
+            finalize_out,
+            finalize=(finalize_out, dst2token, row_weights),
+        )
+        return StandardCombineInput(
+            hidden_states=finalize_out.to(torch.bfloat16)
+        )
+
     down_output = torch.empty(
         packed_hidden.shape[0],
         quant_info.w2_weight.shape[1],

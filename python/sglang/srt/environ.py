@@ -970,6 +970,10 @@ class Envs:
     # flipped at load time). E2E on RTX PRO 5000: prefill +0.4%, decode
     # neutral; GSM8K smoke 0.832 (on-side).
     SGLANG_FLASHINFER_SM120_FP8_GATED = EnvBool(True)
+    # FINALIZE fusion for the SM120 FP8 MoE runner: GEMM2's epilogue combines
+    # weighted rows straight into the token output (SwapAB/decode shapes),
+    # removing the unpermute kernel. Off until acceptance signs off.
+    SGLANG_FLASHINFER_SM120_FP8_MOE_FINALIZE = EnvBool(False)
     SGLANG_OPT_USE_BF16_ROUTER_GEMM = EnvBool(True)
     SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
     SGLANG_DISABLE_MSA = EnvBool(False)

@@ -529,3 +529,71 @@ def fused_quant_pack_flashinfer_sm120_fp8(
         m_indptr,
     )
     return out, out_scale
+
+
+@triton.jit
+def _finalize_metadata_kernel(
+    topk_ids_ptr,
+    topk_weights_ptr,
+    src2dst_ptr,
+    dst2token_ptr,
+    row_weights_ptr,
+    num_routes,
+    scaling,
+    top_k: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    routes = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = routes < num_routes
+    experts = tl.load(topk_ids_ptr + routes, mask=mask, other=0)
+    dst = tl.load(src2dst_ptr + routes, mask=mask, other=0)
+    weights = tl.load(topk_weights_ptr + routes, mask=mask, other=0.0) * scaling
+    # CUDA-graph padded routes carry topk_ids == -1; their packed rows must be
+    # marked -1 so the finalize epilogue skips them. Every packed row is
+    # covered by exactly one route (src2dst is a permutation), so plain
+    # stores fully initialize both arrays.
+    token = tl.where(experts >= 0, routes // top_k, -1)
+    tl.store(dst2token_ptr + dst, token, mask=mask)
+    tl.store(row_weights_ptr + dst, weights, mask=mask)
+
+
+def build_finalize_metadata_flashinfer_sm120_fp8(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    src2dst: torch.Tensor,
+    *,
+    routed_scaling_factor: Optional[float] = None,
+    dst2token: Optional[torch.Tensor] = None,
+    row_weights: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if topk_ids.dtype != torch.int32 or topk_ids.ndim != 2:
+        raise TypeError("topk_ids must be a 2D int32 tensor")
+    if topk_weights.dtype != torch.float32 or topk_weights.shape != topk_ids.shape:
+        raise TypeError("topk_weights must be float32 with the topk_ids shape")
+    routes = topk_ids.numel()
+    if src2dst.dtype != torch.int32 or src2dst.numel() != routes:
+        raise TypeError("src2dst must be int32 with one entry per routed slot")
+
+    if dst2token is None:
+        dst2token = torch.empty(routes, dtype=torch.int32, device=topk_ids.device)
+    if row_weights is None:
+        row_weights = torch.empty(routes, dtype=torch.float32, device=topk_ids.device)
+    if dst2token.shape != (routes,) or dst2token.dtype != torch.int32:
+        raise ValueError("dst2token must be int32 with shape (routes,)")
+    if row_weights.shape != (routes,) or row_weights.dtype != torch.float32:
+        raise ValueError("row_weights must be float32 with shape (routes,)")
+
+    if routes > 0:
+        BLOCK = 256
+        _finalize_metadata_kernel[(triton.cdiv(routes, BLOCK),)](
+            topk_ids.view(-1),
+            topk_weights.contiguous().view(-1),
+            src2dst,
+            dst2token,
+            row_weights,
+            routes,
+            1.0 if routed_scaling_factor is None else float(routed_scaling_factor),
+            top_k=topk_ids.shape[1],
+            BLOCK=BLOCK,
+        )
+    return dst2token, row_weights

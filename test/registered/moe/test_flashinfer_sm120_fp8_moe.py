@@ -1129,6 +1129,77 @@ class TestFlashInferSm120Fp8Packing(unittest.TestCase):
                     dispatch, plain_info, config
                 )
 
+    def test_full_runner_finalize_matches_packed(self):
+        from sglang.srt.layers.moe.moe_runner import (
+            flashinfer_sm120_fp8 as runner,
+        )
+
+        # 16 experts in _make_runner_case: routes/experts <= 8 keeps the
+        # decode-shaped SwapAB tile rule satisfied for both cases.
+        cases = ((1, 1), (8, 8))
+        for tokens, top_k in cases:
+            with self.subTest(tokens=tokens, top_k=top_k):
+                torch.manual_seed(43)
+                topk_ids = (
+                    torch.randint(
+                        0, 16, (tokens, top_k), device="cuda"
+                    ).to(torch.int32)
+                )
+                dispatch, config, quant_info, _, _ = _make_runner_case(
+                    tokens, top_k, topk_ids, seed=47
+                )
+
+                with patch.object(
+                    runner, "_use_finalize", return_value=False
+                ):
+                    packed_out = (
+                        runner.fused_experts_none_to_flashinfer_sm120_fp8(
+                            dispatch, quant_info, config
+                        ).hidden_states
+                    )
+                with patch.object(
+                    runner, "_use_finalize", return_value=True
+                ):
+                    finalize_out = (
+                        runner.fused_experts_none_to_flashinfer_sm120_fp8(
+                            dispatch, quant_info, config
+                        ).hidden_states
+                    )
+
+                self.assertEqual(finalize_out.dtype, torch.bfloat16)
+                self.assertEqual(finalize_out.shape, packed_out.shape)
+                # Finalize combines pre-bf16-rounding accumulator values;
+                # the packed path rounds GEMM2 output to bf16 first.
+                full_diff = _calc_diff(finalize_out, packed_out)
+                symmetric_diff = _calc_symmetric_diff(finalize_out, packed_out)
+                normalized_rmse = _calc_normalized_rmse(finalize_out, packed_out)
+                self.assertLess(full_diff, _FULL_MEAN_ABS_REL_TOL)
+                self.assertLess(symmetric_diff, _FULL_SYMMETRIC_DIFF_TOL)
+                self.assertLess(normalized_rmse, _FULL_NORMALIZED_RMSE_TOL)
+
+    def test_full_runner_finalize_falls_back_above_tile_rule(self):
+        from sglang.srt.layers.moe.moe_runner import (
+            flashinfer_sm120_fp8 as runner,
+        )
+
+        # 128 tokens x top_k 2 over 16 experts -> routes/experts = 16 > 8:
+        # the runner must silently keep the packed path (no FI error).
+        topk_ids = (
+            torch.arange(256, device="cuda", dtype=torch.int32)
+            .remainder(16)
+            .view(128, 2)
+        )
+        sorted_ids = topk_ids.sort(dim=1).values
+        self.assertTrue(bool((sorted_ids[:, 1:] != sorted_ids[:, :-1]).all()))
+        dispatch, config, quant_info, _, _ = _make_runner_case(
+            128, 2, topk_ids, seed=53
+        )
+        with patch.object(runner, "_use_finalize", return_value=True):
+            out = runner.fused_experts_none_to_flashinfer_sm120_fp8(
+                dispatch, quant_info, config
+            ).hidden_states
+        self.assertTrue(bool(torch.isfinite(out).all()))
+
     def test_fused_swiglu_quant_pack_reused_outputs_clear_padding(self):
         from sglang.jit_kernel.activation import silu_and_mul
         from sglang.kernels.ops.moe.flashinfer_sm120_fp8 import (
