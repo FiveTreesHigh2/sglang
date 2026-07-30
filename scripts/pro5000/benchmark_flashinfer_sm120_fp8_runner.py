@@ -135,6 +135,10 @@ class SharedWeights:
     w2_scale: Any
     w13_scale_fi: Any
     w2_scale_fi: Any
+    # Gated (up-first) FI variants; None when SGLANG_FLASHINFER_SM120_FP8_GATED
+    # is off. The Triton reference always consumes the gate-first originals.
+    w13_weight_gated: Any = None
+    w13_scale_fi_gated: Any = None
 
 
 @dataclass
@@ -625,6 +629,23 @@ def create_shared_weights(seed: int) -> SharedWeights:
         w13_scale,
         w2_scale,
     )
+    w13_weight_gated = None
+    w13_scale_fi_gated = None
+    from sglang.srt.environ import envs as _envs
+
+    if _envs.SGLANG_FLASHINFER_SM120_FP8_GATED.get():
+        half = w13_weight.shape[1] // 2
+        scale_half = w13_scale.shape[1] // 2
+        w13_weight_gated = torch.cat(
+            [w13_weight[:, half:], w13_weight[:, :half]], dim=1
+        ).contiguous()
+        w13_scale_gated = torch.cat(
+            [w13_scale[:, scale_half:], w13_scale[:, :scale_half]], dim=1
+        ).contiguous()
+        w13_scale_fi_gated, _ = prepare_flashinfer_sm120_fp8_weight_scales(
+            w13_scale_gated,
+            w2_scale,
+        )
     return SharedWeights(
         w13_weight=w13_weight,
         w2_weight=w2_weight,
@@ -632,6 +653,8 @@ def create_shared_weights(seed: int) -> SharedWeights:
         w2_scale=w2_scale,
         w13_scale_fi=w13_scale_fi,
         w2_scale_fi=w2_scale_fi,
+        w13_weight_gated=w13_weight_gated,
+        w13_scale_fi_gated=w13_scale_fi_gated,
     )
 
 
@@ -695,13 +718,23 @@ def make_runner_case(
         inplace=False,
         routed_scaling_factor=1.0,
     )
-    quant_info = FlashInferSm120Fp8MoeQuantInfo(
-        shared_weights.w13_weight,
-        shared_weights.w2_weight,
-        shared_weights.w13_scale_fi,
-        shared_weights.w2_scale_fi,
-        BLOCK_SHAPE,
-    )
+    if shared_weights.w13_weight_gated is not None:
+        quant_info = FlashInferSm120Fp8MoeQuantInfo(
+            shared_weights.w13_weight_gated,
+            shared_weights.w2_weight,
+            shared_weights.w13_scale_fi_gated,
+            shared_weights.w2_scale_fi,
+            BLOCK_SHAPE,
+            w13_up_first=True,
+        )
+    else:
+        quant_info = FlashInferSm120Fp8MoeQuantInfo(
+            shared_weights.w13_weight,
+            shared_weights.w2_weight,
+            shared_weights.w13_scale_fi,
+            shared_weights.w2_scale_fi,
+            BLOCK_SHAPE,
+        )
     return RunnerCase(
         tokens=tokens,
         top_k=top_k,
