@@ -549,6 +549,18 @@ def _calc_normalized_rmse(actual: Any, expected: Any) -> float:
 
 def compare_outputs(actual: Any, expected: Any) -> dict[str, Any]:
     import torch
+    from sglang.srt.environ import envs as _envs
+
+    # Gated mode computes SiLU on the fp32 GEMM accumulator while the Triton
+    # reference rounds to bf16 first; the rounding chains legitimately diverge
+    # (~0.7% mean-rel measured). Mirrors the unit-test gated tolerance band;
+    # GSM8K/MMLU remains the final arbiter.
+    if _envs.SGLANG_FLASHINFER_SM120_FP8_GATED.get():
+        tol_calc, tol_sym, tol_nrmse = 2e-2, 2e-3, 3e-2
+    else:
+        tol_calc = FULL_MEAN_ABS_REL_TOL
+        tol_sym = FULL_SYMMETRIC_DIFF_TOL
+        tol_nrmse = FULL_NORMALIZED_RMSE_TOL
 
     finite = bool(torch.isfinite(actual).all()) and bool(
         torch.isfinite(expected).all()
@@ -558,9 +570,9 @@ def compare_outputs(actual: Any, expected: Any) -> dict[str, Any]:
     normalized_rmse = _calc_normalized_rmse(actual, expected)
     passed = (
         finite
-        and calc_diff < FULL_MEAN_ABS_REL_TOL
-        and symmetric_diff < FULL_SYMMETRIC_DIFF_TOL
-        and normalized_rmse < FULL_NORMALIZED_RMSE_TOL
+        and calc_diff < tol_calc
+        and symmetric_diff < tol_sym
+        and normalized_rmse < tol_nrmse
     )
     return {
         "status": "PASS" if passed else "FAIL",
@@ -569,9 +581,9 @@ def compare_outputs(actual: Any, expected: Any) -> dict[str, Any]:
         "symmetric_diff": symmetric_diff,
         "normalized_rmse": normalized_rmse,
         "thresholds": {
-            "calc_diff": FULL_MEAN_ABS_REL_TOL,
-            "symmetric_diff": FULL_SYMMETRIC_DIFF_TOL,
-            "normalized_rmse": FULL_NORMALIZED_RMSE_TOL,
+            "calc_diff": tol_calc,
+            "symmetric_diff": tol_sym,
+            "normalized_rmse": tol_nrmse,
         },
     }
 
