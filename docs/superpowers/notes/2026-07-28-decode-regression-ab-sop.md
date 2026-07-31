@@ -244,6 +244,16 @@ smem tile-cumsum 协作预计算 + 二分查找，枚举顺序逐位不变。改
 
 **修正后的优先级**：① LM head GEMV（单项 0.83ms、带宽利用率仅 ~47%、普适、~0.4ms 上限）②MoE glue 融合（unpermute FINALIZE + gated GEMM1 小 M 税 18.8vs10.0μs，等上游或自研）③ dense GEMM 3.5ms 大头（latency-bound，暂留档）。
 
+### 2026-07-31 FINALIZE 融合收尾（默认开启）
+
+目标重设：decode 与 Triton baseline 持平（LM head GEMV 降 backlog——baseline 同受益不缩相对差距）。
+
+- 实现：flashinfer fork `moe-finalize-fusion`（c9409d29→42d419d5，含 tvm::ffi::Optional 作用域修复）：SwapAB pred-stg epilogue 加 finalize 变体——fp32 accum 直接乘 row_weights 原子累加进 out_finalize[dst2token[row]]，-1 行跳过；非 SwapAB tile / is_gated 组合请求硬报错。sglang `8fbc99367`+`6a9b37b29`：metadata Triton kernel（routed_scaling 折入 row_weights）、runner 分支（rows/experts≤8 镜像 tile 规则、超限静默走 packed）、fp32→bf16 cast
+- 验收：FI 测试 50/50（含 finalize 对照/负行/拒绝 3 case）；sglang 21/22（B13 旧账豁免；另修一笔 gated 默认翻转的测试隔离债——setUp 钉 _use_gated=False）；E2E：**decode bs=1 6.48→6.32ms、bs=128 58.49→57.99ms、prefill 37582（持平）**
+- **平差进度：bs=1 vs baseline 6.18 剩 +0.14ms（原 0.30）；bs=128 vs 57.96 剩 +0.03ms（原 0.53，达成持平）**——bs=128 意外全额收回：1024 routes/256 experts=4≤8 同样命中 SwapAB+finalize
+- 生产环境变量：`SGLANG_FLASHINFER_SM120_FP8_MOE_FINALIZE` 默认已翻 True，回滚=env 置 0
+- 后续：bs=1 剩余 0.14ms 主要在 gated GEMM1 小 M 税（18.8 vs 10.0μs）与 B3/守卫尾巴；上游 PR（finalize 变体对 mxfp8 同样适用）与 nightly 正规化（#7）待办
+
 ### 2026-07-29 档 A 完成（提前启动，未等 nightly）
 
 - 方式：cherry-pick #4130（merge commit 92274ba1）到 pinned tag `b35396c1`，零冲突；依赖核查：97 个中间 commit 仅 #4185 触碰相关路径且只改 cuDNN 测试标记，PR 引用符号在 tag 上全部存在。分支 `adopt-pr4130`（`55b030f3`，含我们移植的 256-expert 稀疏 case ×4）已推 fork。部署仍走文件覆盖（27 文件含 2 个 Python core.py——op 绑定加了 is_gated 参数）
