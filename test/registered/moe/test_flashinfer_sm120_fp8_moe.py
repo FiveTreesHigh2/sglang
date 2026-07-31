@@ -274,6 +274,19 @@ def _run_triton_reference(
 
 @unittest.skipUnless(_IS_SM120, "SM120/SM121 required")
 class TestFlashInferSm120Fp8Packing(unittest.TestCase):
+    def setUp(self):
+        # _make_runner_case builds gate-first (unflipped) weights by default;
+        # pin the runner to plain GEMM1 so these tests stay independent of the
+        # SGLANG_FLASHINFER_SM120_FP8_GATED default (now True). Gated tests
+        # override with their own inner patch.
+        from sglang.srt.layers.moe.moe_runner import (
+            flashinfer_sm120_fp8 as _runner,
+        )
+
+        patcher = patch.object(_runner, "_use_gated", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_existing_moe_permute_copies_fp8_bits(self):
         torch.manual_seed(7)
         tokens, hidden, experts, top_k = 8, 256, 8, 2
