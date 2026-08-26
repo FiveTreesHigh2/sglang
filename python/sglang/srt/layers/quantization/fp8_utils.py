@@ -827,6 +827,7 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
+    weight_scale_mn: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     assert input_scale is None
 
@@ -856,7 +857,10 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
         expected_weight_scale_shape = (k // block_k, n // block_n)
         if x_scale.shape == (m, k // block_k):
             x_scale = x_scale.transpose(-1, -2).contiguous()
-        if weight_scale.shape == (n // block_n, k // block_k):
+        if weight_scale_mn is not None:
+            # Already transposed at weight load; skip the per-call copy.
+            weight_scale = weight_scale_mn
+        elif weight_scale.shape == (n // block_n, k // block_k):
             weight_scale = weight_scale.transpose(-1, -2).contiguous()
         assert x_scale.shape == expected_x_scale_shape, (
             "FlashInfer CUTLASS groupwise FP8 expects A scale layout "

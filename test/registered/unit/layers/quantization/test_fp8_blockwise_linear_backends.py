@@ -174,6 +174,32 @@ class TestFp8BlockwiseLinearBackends(_LinearBackendCheck):
     def test_cutlass(self):
         self._run("cutlass")
 
+    def test_flashinfer_cutlass_weight_scale_mn_is_bitwise(self):
+        """The load-time MN-major weight scale must not change results."""
+        backend = "flashinfer_cutlass"
+        if backend not in _fp8_block_backends():
+            self.skipTest(f"{backend} not in SM{get_device_sm()} backend set")
+        torch.manual_seed(7)
+        for m, n, k in FP8_BLOCK_SHAPES:
+            with self.subTest(shape=(m, n, k)):
+                with mock.patch.object(
+                    fp8_utils,
+                    "FP8_GEMM_RUNNER_BACKEND",
+                    Fp8GemmRunnerBackend(backend),
+                ):
+                    layer, _ = self._build_layer(n, k)
+                    layer.quant_method.process_weights_after_loading(layer)
+                    self.assertIsNotNone(getattr(layer, "weight_scale_inv_mn", None))
+
+                    x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) / 10
+                    pretransposed, _ = layer(x)
+
+                    # Without the attribute the wrapper transposes per call.
+                    del layer.weight_scale_inv_mn
+                    per_call, _ = layer(x)
+
+                    self.assertTrue(torch.equal(pretransposed, per_call))
+
 
 @unittest.skipIf(get_device_sm() < 90, "FP8 GEMM backends require SM90+")
 class TestMxfp8LinearBackends(_LinearBackendCheck):

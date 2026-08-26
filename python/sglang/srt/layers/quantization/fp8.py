@@ -60,6 +60,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     deepgemm_w8a8_block_fp8_linear_with_fallback,
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
+    flashinfer_gemm_w8a8_block_fp8_linear_with_fallback,
     input_to_float8,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -727,6 +728,18 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.weight.copy_(t)
                 del t
 
+        if (
+            self.w8a8_block_fp8_linear
+            is flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
+        ):
+            # Constant scale, so transpose to the CUTLASS "MN" layout once here
+            # rather than on every GEMM call.
+            copy_or_rebind_param(
+                layer,
+                "weight_scale_inv_mn",
+                layer.weight_scale_inv.data.transpose(-1, -2).contiguous(),
+            )
+
     def _process_mxfp8_linear_weight_scale(self, layer: Module) -> None:
         if not self.use_mxfp8:
             return
@@ -1023,6 +1036,11 @@ class Fp8LinearMethod(LinearMethodBase):
                     bias=bias,
                 )
 
+            block_fp8_extra_kwargs = {}
+            weight_scale_mn = getattr(layer, "weight_scale_inv_mn", None)
+            if weight_scale_mn is not None:
+                block_fp8_extra_kwargs["weight_scale_mn"] = weight_scale_mn
+
             return self.w8a8_block_fp8_linear(
                 input=x,
                 weight=layer.weight,
@@ -1030,6 +1048,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_scale=layer.weight_scale_inv,
                 input_scale=None,
                 bias=bias,
+                **block_fp8_extra_kwargs,
             )
 
         if isinstance(x, tuple):
